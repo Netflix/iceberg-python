@@ -274,6 +274,14 @@ class RestCatalog(Catalog):
         if property_as_bool(self.properties, SIGV4, False):
             self._init_sigv4(session)
 
+        # Mount custom adapters
+        if session_adapters := self.properties.get("session_adapters"):
+            for prefix, adapter in session_adapters.items():  # type: ignore
+                session.mount(prefix, adapter)
+        # Add custom auth
+        if session_auth := self.properties.get("session_auth"):
+            session.auth = session_auth  # type: ignore
+
         return session
 
     def _create_legacy_oauth2_auth_manager(self, session: Session) -> AuthManager:
