@@ -39,15 +39,19 @@ from mypy_boto3_glue.type_defs import (
 )
 
 from pyiceberg.catalog import (
+    DEPRECATED_ACCESS_KEY_ID,
+    DEPRECATED_BOTOCORE_SESSION,
+    DEPRECATED_PROFILE_NAME,
+    DEPRECATED_REGION,
+    DEPRECATED_SECRET_ACCESS_KEY,
+    DEPRECATED_SESSION_TOKEN,
     EXTERNAL_TABLE,
     ICEBERG,
     LOCATION,
     METADATA_LOCATION,
     PREVIOUS_METADATA_LOCATION,
     TABLE_TYPE,
-    Catalog,
-    Identifier,
-    Properties,
+    MetastoreCatalog,
     PropertiesUpdateSummary,
 )
 from pyiceberg.exceptions import (
@@ -60,14 +64,18 @@ from pyiceberg.exceptions import (
     NoSuchTableError,
     TableAlreadyExistsError,
 )
-from pyiceberg.io import load_file_io
+from pyiceberg.io import AWS_ACCESS_KEY_ID, AWS_REGION, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN
 from pyiceberg.partitioning import UNPARTITIONED_PARTITION_SPEC, PartitionSpec
 from pyiceberg.schema import Schema, SchemaVisitor, visit
 from pyiceberg.serializers import FromInputFile
-from pyiceberg.table import CommitTableRequest, CommitTableResponse, Table, update_table_metadata
-from pyiceberg.table.metadata import TableMetadata, new_table_metadata
+from pyiceberg.table import (
+    CommitTableRequest,
+    CommitTableResponse,
+    Table,
+)
+from pyiceberg.table.metadata import TableMetadata
 from pyiceberg.table.sorting import UNSORTED_SORT_ORDER, SortOrder
-from pyiceberg.typedef import EMPTY_DICT
+from pyiceberg.typedef import EMPTY_DICT, Identifier, Properties
 from pyiceberg.types import (
     BinaryType,
     BooleanType,
@@ -89,9 +97,17 @@ from pyiceberg.types import (
     TimeType,
     UUIDType,
 )
+from pyiceberg.utils.properties import get_first_property_value, property_as_bool
 
 if TYPE_CHECKING:
     import pyarrow as pa
+
+
+# There is a unique Glue metastore in each AWS account and each AWS region. By default, GlueCatalog chooses the Glue
+# metastore to use based on the user's default AWS client credential and region setup. You can specify the Glue catalog
+# ID through glue.id catalog property to point to a Glue catalog in a different AWS account. The Glue catalog ID is your
+# numeric AWS account ID.
+GLUE_ID = "glue.id"
 
 # If Glue should skip archiving an old table version when creating a new version in a commit. By
 # default, Glue archives all old table versions after an UpdateTable call, but Glue has a default
@@ -100,9 +116,19 @@ if TYPE_CHECKING:
 GLUE_SKIP_ARCHIVE = "glue.skip-archive"
 GLUE_SKIP_ARCHIVE_DEFAULT = True
 
+# Configure an alternative endpoint of the Glue service for GlueCatalog to access.
+# This could be used to use GlueCatalog with any glue-compatible metastore service that has a different endpoint
+GLUE_CATALOG_ENDPOINT = "glue.endpoint"
+
 ICEBERG_FIELD_ID = "iceberg.field.id"
 ICEBERG_FIELD_OPTIONAL = "iceberg.field.optional"
 ICEBERG_FIELD_CURRENT = "iceberg.field.current"
+
+GLUE_PROFILE_NAME = "glue.profile-name"
+GLUE_REGION = "glue.region"
+GLUE_ACCESS_KEY_ID = "glue.access-key-id"
+GLUE_SECRET_ACCESS_KEY = "glue.secret-access-key"
+GLUE_SESSION_TOKEN = "glue.session-token"
 
 
 def _construct_parameters(
@@ -152,7 +178,7 @@ class _IcebergSchemaToGlueType(SchemaVisitor[str]):
         if isinstance(primitive, DecimalType):
             return f"decimal({primitive.precision},{primitive.scale})"
         if (primitive_type := type(primitive)) not in GLUE_PRIMITIVE_TYPES:
-            return str(primitive_type.root)
+            return str(primitive)
         return GLUE_PRIMITIVE_TYPES[primitive_type]
 
 
@@ -252,19 +278,44 @@ def _construct_database_input(database_name: str, properties: Properties) -> Dat
     return database_input
 
 
-class GlueCatalog(Catalog):
+def _register_glue_catalog_id_with_glue_client(glue: GlueClient, glue_catalog_id: str) -> None:
+    """
+    Register the Glue Catalog ID (AWS Account ID) as a parameter on all Glue client methods.
+
+    It's more ergonomic to do this than to pass the CatalogId as a parameter to every client call since it's an optional
+    parameter and boto3 does not support 'None' values for missing parameters.
+    """
+    event_system = glue.meta.events
+
+    def add_glue_catalog_id(params: Dict[str, str], **kwargs: Any) -> None:
+        if "CatalogId" not in params:
+            params["CatalogId"] = glue_catalog_id
+
+    event_system.register("provide-client-params.glue", add_glue_catalog_id)
+
+
+class GlueCatalog(MetastoreCatalog):
     def __init__(self, name: str, **properties: Any):
         super().__init__(name, **properties)
 
         session = boto3.Session(
-            profile_name=properties.get("profile_name"),
-            region_name=properties.get("region_name"),
-            botocore_session=properties.get("botocore_session"),
-            aws_access_key_id=properties.get("aws_access_key_id"),
-            aws_secret_access_key=properties.get("aws_secret_access_key"),
-            aws_session_token=properties.get("aws_session_token"),
+            profile_name=get_first_property_value(properties, GLUE_PROFILE_NAME, DEPRECATED_PROFILE_NAME),
+            region_name=get_first_property_value(properties, GLUE_REGION, AWS_REGION, DEPRECATED_REGION),
+            botocore_session=properties.get(DEPRECATED_BOTOCORE_SESSION),
+            aws_access_key_id=get_first_property_value(
+                properties, GLUE_ACCESS_KEY_ID, AWS_ACCESS_KEY_ID, DEPRECATED_ACCESS_KEY_ID
+            ),
+            aws_secret_access_key=get_first_property_value(
+                properties, GLUE_SECRET_ACCESS_KEY, AWS_SECRET_ACCESS_KEY, DEPRECATED_SECRET_ACCESS_KEY
+            ),
+            aws_session_token=get_first_property_value(
+                properties, GLUE_SESSION_TOKEN, AWS_SESSION_TOKEN, DEPRECATED_SESSION_TOKEN
+            ),
         )
-        self.glue: GlueClient = session.client("glue")
+        self.glue: GlueClient = session.client("glue", endpoint_url=properties.get(GLUE_CATALOG_ENDPOINT))
+
+        if glue_catalog_id := properties.get(GLUE_ID):
+            _register_glue_catalog_id_with_glue_client(self.glue, glue_catalog_id)
 
     def _convert_glue_to_iceberg(self, glue_table: TableTypeDef) -> Table:
         properties: Properties = glue_table["Parameters"]
@@ -291,11 +342,11 @@ class GlueCatalog(Catalog):
             )
         metadata_location = properties[METADATA_LOCATION]
 
-        io = load_file_io(properties=self.properties, location=metadata_location)
+        io = self._load_file_io(location=metadata_location)
         file = io.new_input(metadata_location)
         metadata = FromInputFile.table_metadata(file)
         return Table(
-            identifier=(self.name, database_name, table_name),
+            identifier=(database_name, table_name),
             metadata=metadata,
             metadata_location=metadata_location,
             io=self._load_file_io(metadata.properties, metadata_location),
@@ -315,7 +366,7 @@ class GlueCatalog(Catalog):
             self.glue.update_table(
                 DatabaseName=database_name,
                 TableInput=table_input,
-                SkipArchive=self.properties.get(GLUE_SKIP_ARCHIVE, GLUE_SKIP_ARCHIVE_DEFAULT),
+                SkipArchive=property_as_bool(self.properties, GLUE_SKIP_ARCHIVE, GLUE_SKIP_ARCHIVE_DEFAULT),
                 VersionId=version_id,
             )
         except self.glue.exceptions.EntityNotFoundException as e:
@@ -360,20 +411,18 @@ class GlueCatalog(Catalog):
             ValueError: If the identifier is invalid, or no path is given to store metadata.
 
         """
-        schema: Schema = self._convert_schema_if_needed(schema)  # type: ignore
-
-        database_name, table_name = self.identifier_to_database_and_table(identifier)
-
-        location = self._resolve_table_location(location, database_name, table_name)
-        metadata_location = self._get_metadata_location(location=location)
-        metadata = new_table_metadata(
-            location=location, schema=schema, partition_spec=partition_spec, sort_order=sort_order, properties=properties
+        staged_table = self._create_staged_table(
+            identifier=identifier,
+            schema=schema,
+            location=location,
+            partition_spec=partition_spec,
+            sort_order=sort_order,
+            properties=properties,
         )
-        io = load_file_io(properties=self.properties, location=metadata_location)
-        self._write_metadata(metadata, io, metadata_location)
-
-        table_input = _construct_table_input(table_name, metadata_location, properties, metadata)
         database_name, table_name = self.identifier_to_database_and_table(identifier)
+
+        self._write_metadata(staged_table.metadata, staged_table.io, staged_table.metadata_location)
+        table_input = _construct_table_input(table_name, staged_table.metadata_location, properties, staged_table.metadata)
         self._create_glue_table(database_name=database_name, table_name=table_name, table_input=table_input)
 
         return self.load_table(identifier=identifier)
@@ -391,7 +440,14 @@ class GlueCatalog(Catalog):
         Raises:
             TableAlreadyExistsError: If the table already exists
         """
-        raise NotImplementedError
+        database_name, table_name = self.identifier_to_database_and_table(identifier)
+        properties = EMPTY_DICT
+        io = self._load_file_io(location=metadata_location)
+        file = io.new_input(metadata_location)
+        metadata = FromInputFile.table_metadata(file)
+        table_input = _construct_table_input(table_name, metadata_location, properties, metadata)
+        self._create_glue_table(database_name=database_name, table_name=table_name, table_input=table_input)
+        return self.load_table(identifier=identifier)
 
     def _commit_table(self, table_request: CommitTableRequest) -> CommitTableResponse:
         """Update the table.
@@ -404,53 +460,71 @@ class GlueCatalog(Catalog):
 
         Raises:
             NoSuchTableError: If a table with the given identifier does not exist.
-            CommitFailedException: If the commit failed.
+            CommitFailedException: Requirement not met, or a conflict with a concurrent commit.
         """
-        identifier_tuple = self.identifier_to_tuple_without_catalog(
+        identifier_tuple = self._identifier_to_tuple_without_catalog(
             tuple(table_request.identifier.namespace.root + [table_request.identifier.name])
         )
         database_name, table_name = self.identifier_to_database_and_table(identifier_tuple)
 
-        current_glue_table = self._get_glue_table(database_name=database_name, table_name=table_name)
-        glue_table_version_id = current_glue_table.get("VersionId")
-        if not glue_table_version_id:
-            raise CommitFailedException(f"Cannot commit {database_name}.{table_name} because Glue table version id is missing")
-        current_table = self._convert_glue_to_iceberg(glue_table=current_glue_table)
-        base_metadata = current_table.metadata
+        current_glue_table: Optional[TableTypeDef]
+        glue_table_version_id: Optional[str]
+        current_table: Optional[Table]
+        try:
+            current_glue_table = self._get_glue_table(database_name=database_name, table_name=table_name)
+            glue_table_version_id = current_glue_table.get("VersionId")
+            current_table = self._convert_glue_to_iceberg(glue_table=current_glue_table)
+        except NoSuchTableError:
+            current_glue_table = None
+            glue_table_version_id = None
+            current_table = None
 
-        # Validate the update requirements
-        for requirement in table_request.requirements:
-            requirement.validate(base_metadata)
-
-        updated_metadata = update_table_metadata(base_metadata, table_request.updates)
-        if updated_metadata == base_metadata:
+        updated_staged_table = self._update_and_stage_table(current_table, table_request)
+        if current_table and updated_staged_table.metadata == current_table.metadata:
             # no changes, do nothing
-            return CommitTableResponse(metadata=base_metadata, metadata_location=current_table.metadata_location)
-
-        # write new metadata
-        new_metadata_version = self._parse_metadata_version(current_table.metadata_location) + 1
-        new_metadata_location = self._get_metadata_location(current_table.metadata.location, new_metadata_version)
-        self._write_metadata(updated_metadata, current_table.io, new_metadata_location)
-
-        update_table_input = _construct_table_input(
-            table_name=table_name,
-            metadata_location=new_metadata_location,
-            properties=current_table.properties,
-            metadata=updated_metadata,
-            glue_table=current_glue_table,
-            prev_metadata_location=current_table.metadata_location,
+            return CommitTableResponse(metadata=current_table.metadata, metadata_location=current_table.metadata_location)
+        self._write_metadata(
+            metadata=updated_staged_table.metadata,
+            io=updated_staged_table.io,
+            metadata_path=updated_staged_table.metadata_location,
         )
 
-        # Pass `version_id` to implement optimistic locking: it ensures updates are rejected if concurrent
-        # modifications occur. See more details at https://iceberg.apache.org/docs/latest/aws/#optimistic-locking
-        self._update_glue_table(
-            database_name=database_name,
-            table_name=table_name,
-            table_input=update_table_input,
-            version_id=glue_table_version_id,
-        )
+        if current_table:
+            # table exists, update the table
+            if not glue_table_version_id:
+                raise CommitFailedException(
+                    f"Cannot commit {database_name}.{table_name} because Glue table version id is missing"
+                )
 
-        return CommitTableResponse(metadata=updated_metadata, metadata_location=new_metadata_location)
+            # Pass `version_id` to implement optimistic locking: it ensures updates are rejected if concurrent
+            # modifications occur. See more details at https://iceberg.apache.org/docs/latest/aws/#optimistic-locking
+            update_table_input = _construct_table_input(
+                table_name=table_name,
+                metadata_location=updated_staged_table.metadata_location,
+                properties=updated_staged_table.properties,
+                metadata=updated_staged_table.metadata,
+                glue_table=current_glue_table,
+                prev_metadata_location=current_table.metadata_location,
+            )
+            self._update_glue_table(
+                database_name=database_name,
+                table_name=table_name,
+                table_input=update_table_input,
+                version_id=glue_table_version_id,
+            )
+        else:
+            # table does not exist, create the table
+            create_table_input = _construct_table_input(
+                table_name=table_name,
+                metadata_location=updated_staged_table.metadata_location,
+                properties=updated_staged_table.properties,
+                metadata=updated_staged_table.metadata,
+            )
+            self._create_glue_table(database_name=database_name, table_name=table_name, table_input=create_table_input)
+
+        return CommitTableResponse(
+            metadata=updated_staged_table.metadata, metadata_location=updated_staged_table.metadata_location
+        )
 
     def load_table(self, identifier: Union[str, Identifier]) -> Table:
         """Load the table's metadata and returns the table instance.
@@ -467,7 +541,7 @@ class GlueCatalog(Catalog):
         Raises:
             NoSuchTableError: If a table with the name does not exist, or the identifier is invalid.
         """
-        identifier_tuple = self.identifier_to_tuple_without_catalog(identifier)
+        identifier_tuple = self._identifier_to_tuple_without_catalog(identifier)
         database_name, table_name = self.identifier_to_database_and_table(identifier_tuple, NoSuchTableError)
 
         return self._convert_glue_to_iceberg(self._get_glue_table(database_name=database_name, table_name=table_name))
@@ -481,7 +555,7 @@ class GlueCatalog(Catalog):
         Raises:
             NoSuchTableError: If a table with the name does not exist, or the identifier is invalid.
         """
-        identifier_tuple = self.identifier_to_tuple_without_catalog(identifier)
+        identifier_tuple = self._identifier_to_tuple_without_catalog(identifier)
         database_name, table_name = self.identifier_to_database_and_table(identifier_tuple, NoSuchTableError)
         try:
             self.glue.delete_table(DatabaseName=database_name, Name=table_name)
@@ -507,7 +581,7 @@ class GlueCatalog(Catalog):
             NoSuchPropertyException: When from table miss some required properties.
             NoSuchNamespaceError: When the destination namespace doesn't exist.
         """
-        from_identifier_tuple = self.identifier_to_tuple_without_catalog(from_identifier)
+        from_identifier_tuple = self._identifier_to_tuple_without_catalog(from_identifier)
         from_database_name, from_table_name = self.identifier_to_database_and_table(from_identifier_tuple, NoSuchTableError)
         to_database_name, to_table_name = self.identifier_to_database_and_table(to_identifier)
         try:

@@ -20,6 +20,7 @@ import errno
 import json
 import logging
 import os
+from copy import copy
 from functools import lru_cache, partial
 from typing import (
     Any,
@@ -39,6 +40,16 @@ from requests import HTTPError
 from pyiceberg.catalog import TOKEN
 from pyiceberg.exceptions import SignError
 from pyiceberg.io import (
+    ADLFS_ACCOUNT_KEY,
+    ADLFS_ACCOUNT_NAME,
+    ADLFS_CLIENT_ID,
+    ADLFS_CONNECTION_STRING,
+    ADLFS_SAS_TOKEN,
+    ADLFS_TENANT_ID,
+    AWS_ACCESS_KEY_ID,
+    AWS_REGION,
+    AWS_SECRET_ACCESS_KEY,
+    AWS_SESSION_TOKEN,
     GCS_ACCESS,
     GCS_CACHE_TIMEOUT,
     GCS_CONSISTENCY,
@@ -56,6 +67,10 @@ from pyiceberg.io import (
     S3_REGION,
     S3_SECRET_ACCESS_KEY,
     S3_SESSION_TOKEN,
+    S3_SIGNER_ENDPOINT,
+    S3_SIGNER_ENDPOINT_DEFAULT,
+    S3_SIGNER_URI,
+    ADLFS_ClIENT_SECRET,
     FileIO,
     InputFile,
     InputStream,
@@ -63,6 +78,7 @@ from pyiceberg.io import (
     OutputStream,
 )
 from pyiceberg.typedef import Properties
+from pyiceberg.utils.properties import get_first_property_value, property_as_bool
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +87,9 @@ def s3v4_rest_signer(properties: Properties, request: AWSRequest, **_: Any) -> A
     if TOKEN not in properties:
         raise SignError("Signer set, but token is not available")
 
-    signer_url = properties["uri"].rstrip("/")
+    signer_url = properties.get(S3_SIGNER_URI, properties["uri"]).rstrip("/")
+    signer_endpoint = properties.get(S3_SIGNER_ENDPOINT, S3_SIGNER_ENDPOINT_DEFAULT)
+
     signer_headers = {"Authorization": f"Bearer {properties[TOKEN]}"}
     signer_body = {
         "method": request.method,
@@ -80,7 +98,7 @@ def s3v4_rest_signer(properties: Properties, request: AWSRequest, **_: Any) -> A
         "headers": {key: [val] for key, val in request.headers.items()},
     }
 
-    response = requests.post(f"{signer_url}/v1/aws/s3/sign", headers=signer_headers, json=signer_body)
+    response = requests.post(f"{signer_url}/{signer_endpoint.strip()}", headers=signer_headers, json=signer_body)
     try:
         response.raise_for_status()
         response_json = response.json()
@@ -107,19 +125,19 @@ def _s3(properties: Properties) -> AbstractFileSystem:
 
     client_kwargs = {
         "endpoint_url": properties.get(S3_ENDPOINT),
-        "aws_access_key_id": properties.get(S3_ACCESS_KEY_ID),
-        "aws_secret_access_key": properties.get(S3_SECRET_ACCESS_KEY),
-        "aws_session_token": properties.get(S3_SESSION_TOKEN),
-        "region_name": properties.get(S3_REGION),
+        "aws_access_key_id": get_first_property_value(properties, S3_ACCESS_KEY_ID, AWS_ACCESS_KEY_ID),
+        "aws_secret_access_key": get_first_property_value(properties, S3_SECRET_ACCESS_KEY, AWS_SECRET_ACCESS_KEY),
+        "aws_session_token": get_first_property_value(properties, S3_SESSION_TOKEN, AWS_SESSION_TOKEN),
+        "region_name": get_first_property_value(properties, S3_REGION, AWS_REGION),
     }
     config_kwargs = {}
     register_events: Dict[str, Callable[[Properties], None]] = {}
 
     if signer := properties.get("s3.signer"):
         logger.info("Loading signer %s", signer)
-        if singer_func := SIGNERS.get(signer):
-            singer_func_with_properties = partial(singer_func, properties)
-            register_events["before-sign.s3"] = singer_func_with_properties
+        if signer_func := SIGNERS.get(signer):
+            signer_func_with_properties = partial(signer_func, properties)
+            register_events["before-sign.s3"] = signer_func_with_properties
 
             # Disable the AWS Signer
             config_kwargs["signature_version"] = UNSIGNED
@@ -150,11 +168,11 @@ def _gs(properties: Properties) -> AbstractFileSystem:
         token=properties.get(GCS_TOKEN),
         consistency=properties.get(GCS_CONSISTENCY, "none"),
         cache_timeout=properties.get(GCS_CACHE_TIMEOUT),
-        requester_pays=properties.get(GCS_REQUESTER_PAYS, False),
+        requester_pays=property_as_bool(properties, GCS_REQUESTER_PAYS, False),
         session_kwargs=json.loads(properties.get(GCS_SESSION_KWARGS, "{}")),
         endpoint_url=properties.get(GCS_ENDPOINT),
         default_location=properties.get(GCS_DEFAULT_LOCATION),
-        version_aware=properties.get(GCS_VERSION_AWARE, "false").lower() == "true",
+        version_aware=property_as_bool(properties, GCS_VERSION_AWARE, False),
     )
 
 
@@ -162,13 +180,13 @@ def _adlfs(properties: Properties) -> AbstractFileSystem:
     from adlfs import AzureBlobFileSystem
 
     return AzureBlobFileSystem(
-        connection_string=properties.get("adlfs.connection-string"),
-        account_name=properties.get("adlfs.account-name"),
-        account_key=properties.get("adlfs.account-key"),
-        sas_token=properties.get("adlfs.sas-token"),
-        tenant_id=properties.get("adlfs.tenant-id"),
-        client_id=properties.get("adlfs.client-id"),
-        client_secret=properties.get("adlfs.client-secret"),
+        connection_string=properties.get(ADLFS_CONNECTION_STRING),
+        account_name=properties.get(ADLFS_ACCOUNT_NAME),
+        account_key=properties.get(ADLFS_ACCOUNT_KEY),
+        sas_token=properties.get(ADLFS_SAS_TOKEN),
+        tenant_id=properties.get(ADLFS_TENANT_ID),
+        client_id=properties.get(ADLFS_CLIENT_ID),
+        client_secret=properties.get(ADLFS_ClIENT_SECRET),
     )
 
 
@@ -338,3 +356,14 @@ class FsspecFileIO(FileIO):
         if scheme not in self._scheme_to_fs:
             raise ValueError(f"No registered filesystem for scheme: {scheme}")
         return self._scheme_to_fs[scheme](self.properties)
+
+    def __getstate__(self) -> Dict[str, Any]:
+        """Create a dictionary of the FsSpecFileIO fields used when pickling."""
+        fileio_copy = copy(self.__dict__)
+        fileio_copy["get_fs"] = None
+        return fileio_copy
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        """Deserialize the state into a FsSpecFileIO instance."""
+        self.__dict__ = state
+        self.get_fs = lru_cache(self._get_fs)

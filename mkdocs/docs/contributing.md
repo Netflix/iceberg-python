@@ -71,7 +71,7 @@ pip3 install -e ".[s3fs,hive]"
 Install it directly for GitHub (not recommended), but sometimes handy:
 
 ```
-pip install "git+https://github.com/apache/iceberg-python.git#egg=pyiceberg[s3fs]"
+pip install "git+https://github.com/apache/iceberg-python.git#egg=pyiceberg[pyarrow]"
 ```
 
 ## Linting
@@ -87,6 +87,16 @@ Pre-commit will automatically fix the violations such as import orders, formatti
 In contrast to the name suggest, it doesn't run the checks on the commit. If this is something that you like, you can set this up by running `pre-commit install`.
 
 You can bump the integrations to the latest version using `pre-commit autoupdate`. This will check if there is a newer version of `{black,mypy,isort,...}` and update the yaml.
+
+## Cleaning
+
+Removal of old cached files generated during the Cython build process:
+
+```bash
+make clean
+```
+
+Helps prevent build failures and unexpected behavior by removing outdated files, ensuring that only up-to-date sources are used & the build environment is always clean.
 
 ## Testing
 
@@ -168,6 +178,24 @@ Which will warn:
 
 ```
 Call to load_something, deprecated in 0.1.0, will be removed in 0.2.0. Please use load_something_else() instead.
+```
+
+If you want to remove a property or notify about a behavior change, please add a deprecation notice by calling the deprecation_message function:
+
+```python
+from pyiceberg.utils.deprecated import deprecation_message
+
+deprecation_message(
+    deprecated_in="0.1.0",
+    removed_in="0.2.0",
+    help_message="The old_property is deprecated. Please use the something_else property instead.",
+)
+```
+
+Which will warn:
+
+```
+Deprecated in 0.1.0, will be removed in 0.2.0. The old_property is deprecated. Please use the something_else property instead.
 ```
 
 ## Type annotations

@@ -43,6 +43,8 @@ from pyiceberg.types import (
     TimestamptzType,
     TimeType,
     UUIDType,
+    strtobool,
+    transform_dict_value_to_str,
 )
 
 non_parameterized_types = [
@@ -523,7 +525,7 @@ def test_serialization_struct() -> None:
     expected = (
         '{"type":"struct","fields":['
         '{"id":1,"name":"required_field","type":"string","required":true,"doc":"this is a doc"},'
-        '{"id":2,"name":"optional_field","type":"int","required":true}'
+        '{"id":2,"name":"optional_field","type":"int","required":false}'
         "]}"
     )
     assert actual == expected
@@ -545,7 +547,7 @@ def test_deserialization_struct() -> None:
                 "id": 2,
                 "name": "optional_field",
                 "type": "int",
-                "required": true
+                "required": false
             }
         ]
     }
@@ -560,13 +562,13 @@ def test_deserialization_struct() -> None:
 
 
 def test_str_struct(simple_struct: StructType) -> None:
-    assert str(simple_struct) == "struct<1: required_field: required string (this is a doc), 2: optional_field: required int>"
+    assert str(simple_struct) == "struct<1: required_field: required string (this is a doc), 2: optional_field: optional int>"
 
 
 def test_repr_struct(simple_struct: StructType) -> None:
     assert (
         repr(simple_struct)
-        == "StructType(fields=(NestedField(field_id=1, name='required_field', field_type=StringType(), required=True), NestedField(field_id=2, name='optional_field', field_type=IntegerType(), required=True),))"
+        == "StructType(fields=(NestedField(field_id=1, name='required_field', field_type=StringType(), required=True), NestedField(field_id=2, name='optional_field', field_type=IntegerType(), required=False),))"
     )
 
 
@@ -619,3 +621,43 @@ def test_types_singleton() -> None:
     assert id(BooleanType()) == id(BooleanType())
     assert id(FixedType(22)) == id(FixedType(22))
     assert id(FixedType(19)) != id(FixedType(25))
+
+
+def test_deepcopy_of_singleton_fixed_type() -> None:
+    """FixedType is a singleton, so deepcopy should return the same instance"""
+    from copy import deepcopy
+
+    list_of_fixed_types = [FixedType(22), FixedType(19)]
+    copied_list = deepcopy(list_of_fixed_types)
+
+    for lhs, rhs in zip(list_of_fixed_types, copied_list):
+        assert id(lhs) == id(rhs)
+
+
+def test_strtobool() -> None:
+    # Values that should return True
+    true_values = ["y", "yes", "t", "true", "on", "1"]
+    for val in true_values:
+        assert strtobool(val) is True, f"Expected True for value: {val}"
+
+    # Values that should return False
+    false_values = ["n", "no", "f", "false", "off", "0"]
+    for val in false_values:
+        assert strtobool(val) is False, f"Expected False for value: {val}"
+
+    # Values that should raise ValueError
+    invalid_values = ["maybe", "2", "trueish", "falseish", "", " "]
+    for val in invalid_values:
+        with pytest.raises(ValueError, match=f"Invalid truth value: {val!r}"):
+            strtobool(val)
+
+
+def test_transform_dict_value_to_str() -> None:
+    input_dict = {"key1": 1, "key2": 2.0, "key3": "3", "key4: ": True, "key5": False}
+    expected_dict = {"key1": "1", "key2": "2.0", "key3": "3", "key4: ": "true", "key5": "false"}
+    # valid values
+    assert transform_dict_value_to_str(input_dict) == expected_dict
+    # Null value not allowed, should raise ValueError
+    input_dict["key6"] = None
+    with pytest.raises(ValueError, match="None type is not a supported value in properties: key6"):
+        transform_dict_value_to_str(input_dict)

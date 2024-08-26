@@ -42,7 +42,13 @@ from pyiceberg.exceptions import (
     TableAlreadyExistsError,
 )
 from pyiceberg.schema import Schema
-from tests.conftest import BUCKET_NAME, TABLE_METADATA_LOCATION_REGEX
+from pyiceberg.typedef import Properties
+from tests.conftest import (
+    BUCKET_NAME,
+    DEPRECATED_AWS_SESSION_PROPERTIES,
+    TABLE_METADATA_LOCATION_REGEX,
+    UNIFIED_AWS_SESSION_PROPERTIES,
+)
 
 
 @mock_aws
@@ -118,6 +124,21 @@ def test_create_table_with_given_location(
 
 
 @mock_aws
+def test_create_table_removes_trailing_slash_in_location(
+    _bucket_initialize: None, moto_endpoint_url: str, table_schema_nested: Schema, database_name: str, table_name: str
+) -> None:
+    catalog_name = "test_ddb_catalog"
+    identifier = (database_name, table_name)
+    test_catalog = DynamoDbCatalog(catalog_name, **{"s3.endpoint": moto_endpoint_url})
+    test_catalog.create_namespace(namespace=database_name)
+    location = f"s3://{BUCKET_NAME}/{database_name}.db/{table_name}"
+    table = test_catalog.create_table(identifier=identifier, schema=table_schema_nested, location=f"{location}/")
+    assert table.identifier == (catalog_name,) + identifier
+    assert table.location() == location
+    assert TABLE_METADATA_LOCATION_REGEX.match(table.metadata_location)
+
+
+@mock_aws
 def test_create_table_with_no_location(
     _bucket_initialize: None, table_schema_nested: Schema, database_name: str, table_name: str
 ) -> None:
@@ -174,6 +195,18 @@ def test_create_duplicated_table(
     test_catalog.create_table(identifier, table_schema_nested)
     with pytest.raises(TableAlreadyExistsError):
         test_catalog.create_table(identifier, table_schema_nested)
+
+
+@mock_aws
+def test_create_table_if_not_exists_duplicated_table(
+    _bucket_initialize: None, moto_endpoint_url: str, table_schema_nested: Schema, database_name: str, table_name: str
+) -> None:
+    identifier = (database_name, table_name)
+    test_catalog = DynamoDbCatalog("test_ddb_catalog", **{"warehouse": f"s3://{BUCKET_NAME}", "s3.endpoint": moto_endpoint_url})
+    test_catalog.create_namespace(namespace=database_name)
+    table1 = test_catalog.create_table(identifier, table_schema_nested)
+    table2 = test_catalog.create_table_if_not_exists(identifier, table_schema_nested)
+    assert table1.identifier == table2.identifier
 
 
 @mock_aws
@@ -542,11 +575,79 @@ def test_passing_provided_profile() -> None:
     }
     props = {"py-io-impl": "pyiceberg.io.fsspec.FsspecFileIO"}
     props.update(session_props)  # type: ignore
-    with mock.patch('boto3.Session', return_value=mock.Mock()) as mock_session:
+    with mock.patch("boto3.Session", return_value=mock.Mock()) as mock_session:
         mock_client = mock.Mock()
         mock_session.return_value.client.return_value = mock_client
-        mock_client.describe_table.return_value = {'Table': {'TableStatus': 'ACTIVE'}}
+        mock_client.describe_table.return_value = {"Table": {"TableStatus": "ACTIVE"}}
         test_catalog = DynamoDbCatalog(catalog_name, **props)
         assert test_catalog.dynamodb is mock_client
         mock_session.assert_called_with(**session_props)
         assert test_catalog.dynamodb is mock_session().client()
+
+
+@mock_aws
+def test_passing_glue_session_properties() -> None:
+    session_properties: Properties = {
+        "dynamodb.access-key-id": "dynamodb.access-key-id",
+        "dynamodb.secret-access-key": "dynamodb.secret-access-key",
+        "dynamodb.profile-name": "dynamodb.profile-name",
+        "dynamodb.region": "dynamodb.region",
+        "dynamodb.session-token": "dynamodb.session-token",
+        **UNIFIED_AWS_SESSION_PROPERTIES,
+        **DEPRECATED_AWS_SESSION_PROPERTIES,
+    }
+
+    with mock.patch("boto3.Session") as mock_session:
+        mock_client = mock.Mock()
+        mock_session.return_value.client.return_value = mock_client
+        mock_client.describe_table.return_value = {"Table": {"TableStatus": "ACTIVE"}}
+        test_catalog = DynamoDbCatalog("dynamodb", **session_properties)
+
+        mock_session.assert_called_with(
+            aws_access_key_id="dynamodb.access-key-id",
+            aws_secret_access_key="dynamodb.secret-access-key",
+            aws_session_token="dynamodb.session-token",
+            region_name="dynamodb.region",
+            profile_name="dynamodb.profile-name",
+            botocore_session=None,
+        )
+        assert test_catalog.dynamodb is mock_session().client()
+
+
+@mock_aws
+def test_passing_unified_session_properties_to_dynamodb() -> None:
+    session_properties: Properties = {
+        "dynamodb.profile-name": "dynamodb.profile-name",
+        **UNIFIED_AWS_SESSION_PROPERTIES,
+        **DEPRECATED_AWS_SESSION_PROPERTIES,
+    }
+
+    with mock.patch("boto3.Session") as mock_session:
+        mock_client = mock.Mock()
+        mock_session.return_value.client.return_value = mock_client
+        mock_client.describe_table.return_value = {"Table": {"TableStatus": "ACTIVE"}}
+        test_catalog = DynamoDbCatalog("dynamodb", **session_properties)
+
+        mock_session.assert_called_with(
+            aws_access_key_id="client.access-key-id",
+            aws_secret_access_key="client.secret-access-key",
+            aws_session_token="client.session-token",
+            region_name="client.region",
+            profile_name="dynamodb.profile-name",
+            botocore_session=None,
+        )
+        assert test_catalog.dynamodb is mock_session().client()
+
+
+@mock_aws
+def test_table_exists(
+    _bucket_initialize: None, moto_endpoint_url: str, table_schema_nested: Schema, database_name: str, table_name: str
+) -> None:
+    identifier = (database_name, table_name)
+    test_catalog = DynamoDbCatalog("test_ddb_catalog", **{"warehouse": f"s3://{BUCKET_NAME}", "s3.endpoint": moto_endpoint_url})
+    test_catalog.create_namespace(namespace=database_name)
+    test_catalog.create_table(identifier, table_schema_nested)
+    # Act and Assert for an existing table
+    assert test_catalog.table_exists(identifier) is True
+    # Act and Assert for an non-existing  table
+    assert test_catalog.table_exists(("non", "exist")) is False

@@ -18,7 +18,17 @@
 import pytest
 
 from pyiceberg.manifest import DataFile, DataFileContent, ManifestContent, ManifestFile
+from pyiceberg.partitioning import PartitionField, PartitionSpec
+from pyiceberg.schema import Schema
 from pyiceberg.table.snapshots import Operation, Snapshot, SnapshotSummaryCollector, Summary, update_snapshot_summaries
+from pyiceberg.transforms import IdentityTransform
+from pyiceberg.typedef import Record
+from pyiceberg.types import (
+    BooleanType,
+    IntegerType,
+    NestedField,
+    StringType,
+)
 
 
 @pytest.fixture
@@ -67,6 +77,7 @@ def test_serialize_snapshot_without_sequence_number() -> None:
     snapshot = Snapshot(
         snapshot_id=25,
         parent_snapshot_id=19,
+        sequence_number=None,
         timestamp_ms=1602638573590,
         manifest_list="s3:/a/b/c.avro",
         summary=Summary(Operation.APPEND),
@@ -137,26 +148,66 @@ def manifest_file() -> ManifestFile:
     )
 
 
-@pytest.fixture
-def data_file() -> DataFile:
-    return DataFile(
-        content=DataFileContent.DATA,
-        record_count=100,
-        file_size_in_bytes=1234,
-    )
-
-
-def test_snapshot_summary_collector(data_file: DataFile) -> None:
+@pytest.mark.integration
+def test_snapshot_summary_collector(table_schema_simple: Schema) -> None:
     ssc = SnapshotSummaryCollector()
 
     assert ssc.build() == {}
-
-    ssc.add_file(data_file)
+    data_file = DataFile(content=DataFileContent.DATA, record_count=100, file_size_in_bytes=1234, partition=Record())
+    ssc.add_file(data_file, schema=table_schema_simple)
 
     assert ssc.build() == {
-        'added-data-files': '1',
-        'added-files-size': '1234',
-        'added-records': '100',
+        "added-data-files": "1",
+        "added-files-size": "1234",
+        "added-records": "100",
+    }
+
+
+@pytest.mark.integration
+def test_snapshot_summary_collector_with_partition() -> None:
+    # Given
+
+    ssc = SnapshotSummaryCollector()
+
+    assert ssc.build() == {}
+    schema = Schema(
+        NestedField(field_id=1, name="bool_field", field_type=BooleanType(), required=False),
+        NestedField(field_id=2, name="string_field", field_type=StringType(), required=False),
+        NestedField(field_id=3, name="int_field", field_type=IntegerType(), required=False),
+    )
+    spec = PartitionSpec(PartitionField(source_id=3, field_id=1001, transform=IdentityTransform(), name="int_field"))
+    data_file_1 = DataFile(content=DataFileContent.DATA, record_count=100, file_size_in_bytes=1234, partition=Record(int_field=1))
+    data_file_2 = DataFile(content=DataFileContent.DATA, record_count=200, file_size_in_bytes=4321, partition=Record(int_field=2))
+    # When
+    ssc.add_file(data_file=data_file_1, schema=schema, partition_spec=spec)
+    ssc.remove_file(data_file=data_file_1, schema=schema, partition_spec=spec)
+    ssc.remove_file(data_file=data_file_2, schema=schema, partition_spec=spec)
+
+    # Then
+    assert ssc.build() == {
+        "added-files-size": "1234",
+        "removed-files-size": "5555",
+        "added-data-files": "1",
+        "deleted-data-files": "2",
+        "added-records": "100",
+        "deleted-records": "300",
+        "changed-partition-count": "2",
+    }
+
+    # When
+    ssc.set_partition_summary_limit(10)
+
+    # Then
+    assert ssc.build() == {
+        "added-files-size": "1234",
+        "removed-files-size": "5555",
+        "added-data-files": "1",
+        "deleted-data-files": "2",
+        "added-records": "100",
+        "deleted-records": "300",
+        "changed-partition-count": "2",
+        "partitions.int_field=1": "added-files-size=1234,removed-files-size=1234,added-data-files=1,deleted-data-files=1,added-records=100,deleted-records=100",
+        "partitions.int_field=2": "removed-files-size=4321,deleted-data-files=1,deleted-records=200",
     }
 
 
@@ -164,12 +215,12 @@ def test_merge_snapshot_summaries_empty() -> None:
     assert update_snapshot_summaries(Summary(Operation.APPEND)) == Summary(
         operation=Operation.APPEND,
         **{
-            'total-data-files': '0',
-            'total-delete-files': '0',
-            'total-records': '0',
-            'total-files-size': '0',
-            'total-position-deletes': '0',
-            'total-equality-deletes': '0',
+            "total-data-files": "0",
+            "total-delete-files": "0",
+            "total-records": "0",
+            "total-files-size": "0",
+            "total-position-deletes": "0",
+            "total-equality-deletes": "0",
         },
     )
 
@@ -179,12 +230,12 @@ def test_merge_snapshot_summaries_new_summary() -> None:
         summary=Summary(
             operation=Operation.APPEND,
             **{
-                'added-data-files': '1',
-                'added-delete-files': '2',
-                'added-equality-deletes': '3',
-                'added-files-size': '4',
-                'added-position-deletes': '5',
-                'added-records': '6',
+                "added-data-files": "1",
+                "added-delete-files": "2",
+                "added-equality-deletes": "3",
+                "added-files-size": "4",
+                "added-position-deletes": "5",
+                "added-records": "6",
             },
         )
     )
@@ -192,18 +243,18 @@ def test_merge_snapshot_summaries_new_summary() -> None:
     expected = Summary(
         operation=Operation.APPEND,
         **{
-            'added-data-files': '1',
-            'added-delete-files': '2',
-            'added-equality-deletes': '3',
-            'added-files-size': '4',
-            'added-position-deletes': '5',
-            'added-records': '6',
-            'total-data-files': '1',
-            'total-delete-files': '2',
-            'total-records': '6',
-            'total-files-size': '4',
-            'total-position-deletes': '5',
-            'total-equality-deletes': '3',
+            "added-data-files": "1",
+            "added-delete-files": "2",
+            "added-equality-deletes": "3",
+            "added-files-size": "4",
+            "added-position-deletes": "5",
+            "added-records": "6",
+            "total-data-files": "1",
+            "total-delete-files": "2",
+            "total-records": "6",
+            "total-files-size": "4",
+            "total-position-deletes": "5",
+            "total-equality-deletes": "3",
         },
     )
 
@@ -215,44 +266,44 @@ def test_merge_snapshot_summaries_overwrite_summary() -> None:
         summary=Summary(
             operation=Operation.OVERWRITE,
             **{
-                'added-data-files': '1',
-                'added-delete-files': '2',
-                'added-equality-deletes': '3',
-                'added-files-size': '4',
-                'added-position-deletes': '5',
-                'added-records': '6',
+                "added-data-files": "1",
+                "added-delete-files": "2",
+                "added-equality-deletes": "3",
+                "added-files-size": "4",
+                "added-position-deletes": "5",
+                "added-records": "6",
             },
         ),
         previous_summary={
-            'total-data-files': '1',
-            'total-delete-files': '1',
-            'total-equality-deletes': '1',
-            'total-files-size': '1',
-            'total-position-deletes': '1',
-            'total-records': '1',
+            "total-data-files": "1",
+            "total-delete-files": "1",
+            "total-equality-deletes": "1",
+            "total-files-size": "1",
+            "total-position-deletes": "1",
+            "total-records": "1",
         },
         truncate_full_table=True,
     )
 
     expected = {
-        'added-data-files': '1',
-        'added-delete-files': '2',
-        'added-equality-deletes': '3',
-        'added-files-size': '4',
-        'added-position-deletes': '5',
-        'added-records': '6',
-        'total-data-files': '1',
-        'total-records': '6',
-        'total-delete-files': '2',
-        'total-equality-deletes': '3',
-        'total-files-size': '4',
-        'total-position-deletes': '5',
-        'deleted-data-files': '1',
-        'removed-delete-files': '1',
-        'deleted-records': '1',
-        'removed-files-size': '1',
-        'removed-position-deletes': '1',
-        'removed-equality-deletes': '1',
+        "added-data-files": "1",
+        "added-delete-files": "2",
+        "added-equality-deletes": "3",
+        "added-files-size": "4",
+        "added-position-deletes": "5",
+        "added-records": "6",
+        "total-data-files": "1",
+        "total-records": "6",
+        "total-delete-files": "2",
+        "total-equality-deletes": "3",
+        "total-files-size": "4",
+        "total-position-deletes": "5",
+        "deleted-data-files": "1",
+        "removed-delete-files": "1",
+        "deleted-records": "1",
+        "removed-files-size": "1",
+        "removed-position-deletes": "1",
+        "removed-equality-deletes": "1",
     }
 
     assert actual.additional_properties == expected
@@ -263,10 +314,6 @@ def test_invalid_operation() -> None:
         update_snapshot_summaries(summary=Summary(Operation.REPLACE))
     assert "Operation not implemented: Operation.REPLACE" in str(e.value)
 
-    with pytest.raises(ValueError) as e:
-        update_snapshot_summaries(summary=Summary(Operation.DELETE))
-    assert "Operation not implemented: Operation.DELETE" in str(e.value)
-
 
 def test_invalid_type() -> None:
     with pytest.raises(ValueError) as e:
@@ -274,15 +321,15 @@ def test_invalid_type() -> None:
             summary=Summary(
                 operation=Operation.OVERWRITE,
                 **{
-                    'added-data-files': '1',
-                    'added-delete-files': '2',
-                    'added-equality-deletes': '3',
-                    'added-files-size': '4',
-                    'added-position-deletes': '5',
-                    'added-records': '6',
+                    "added-data-files": "1",
+                    "added-delete-files": "2",
+                    "added-equality-deletes": "3",
+                    "added-files-size": "4",
+                    "added-position-deletes": "5",
+                    "added-records": "6",
                 },
             ),
-            previous_summary={'total-data-files': 'abc'},  # should be a number
+            previous_summary={"total-data-files": "abc"},  # should be a number
             truncate_full_table=True,
         )
 

@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import importlib
 import logging
 import re
 import uuid
@@ -36,18 +37,28 @@ from typing import (
     cast,
 )
 
-from pyiceberg.exceptions import NoSuchNamespaceError, NoSuchTableError, NotInstalledError
+from pyiceberg.exceptions import (
+    NamespaceAlreadyExistsError,
+    NoSuchNamespaceError,
+    NoSuchTableError,
+    NotInstalledError,
+    TableAlreadyExistsError,
+)
 from pyiceberg.io import FileIO, load_file_io
 from pyiceberg.manifest import ManifestFile
 from pyiceberg.partitioning import UNPARTITIONED_PARTITION_SPEC, PartitionSpec
 from pyiceberg.schema import Schema
 from pyiceberg.serializers import ToOutputFile
 from pyiceberg.table import (
+    DOWNCAST_NS_TIMESTAMP_TO_US_ON_WRITE,
     CommitTableRequest,
     CommitTableResponse,
+    CreateTableTransaction,
+    StagedTable,
     Table,
-    TableMetadata,
+    update_table_metadata,
 )
+from pyiceberg.table.metadata import TableMetadata, TableMetadataV1, new_table_metadata
 from pyiceberg.table.sorting import UNSORTED_SORT_ORDER, SortOrder
 from pyiceberg.typedef import (
     EMPTY_DICT,
@@ -56,6 +67,7 @@ from pyiceberg.typedef import (
     RecursiveDict,
 )
 from pyiceberg.utils.config import Config, merge_config
+from pyiceberg.utils.deprecated import deprecated, deprecation_message
 
 if TYPE_CHECKING:
     import pyarrow as pa
@@ -66,6 +78,7 @@ _ENV_CONFIG = Config()
 
 TOKEN = "token"
 TYPE = "type"
+PY_CATALOG_IMPL = "py-catalog-impl"
 ICEBERG = "iceberg"
 TABLE_TYPE = "table_type"
 WAREHOUSE_LOCATION = "warehouse"
@@ -89,6 +102,21 @@ TABLE_METADATA_FILE_NAME_REGEX = re.compile(
     """,
     re.X,
 )
+
+DEPRECATED_PROFILE_NAME = "profile_name"
+DEPRECATED_REGION = "region_name"
+DEPRECATED_BOTOCORE_SESSION = "botocore_session"
+DEPRECATED_ACCESS_KEY_ID = "aws_access_key_id"
+DEPRECATED_SECRET_ACCESS_KEY = "aws_secret_access_key"
+DEPRECATED_SESSION_TOKEN = "aws_session_token"
+DEPRECATED_PROPERTY_NAMES = {
+    DEPRECATED_PROFILE_NAME,
+    DEPRECATED_REGION,
+    DEPRECATED_BOTOCORE_SESSION,
+    DEPRECATED_ACCESS_KEY_ID,
+    DEPRECATED_SECRET_ACCESS_KEY,
+    DEPRECATED_SESSION_TOKEN,
+}
 
 
 class CatalogType(Enum):
@@ -207,6 +235,19 @@ def load_catalog(name: Optional[str] = None, **properties: Optional[str]) -> Cat
     catalog_type: Optional[CatalogType]
     provided_catalog_type = conf.get(TYPE)
 
+    if catalog_impl := properties.get(PY_CATALOG_IMPL):
+        if provided_catalog_type:
+            raise ValueError(
+                "Must not set both catalog type and py-catalog-impl configurations, "
+                f"but found type {provided_catalog_type} and py-catalog-impl {catalog_impl}"
+            )
+
+        if catalog := _import_catalog(name, catalog_impl, properties):
+            logger.info("Loaded Catalog: %s", catalog_impl)
+            return catalog
+        else:
+            raise ValueError(f"Could not initialize Catalog: {catalog_impl}")
+
     catalog_type = None
     if provided_catalog_type and isinstance(provided_catalog_type, str):
         catalog_type = CatalogType[provided_catalog_type.upper()]
@@ -257,6 +298,20 @@ def delete_data_files(io: FileIO, manifests_to_delete: List[ManifestFile]) -> No
                 deleted_files[path] = True
 
 
+def _import_catalog(name: str, catalog_impl: str, properties: Properties) -> Optional[Catalog]:
+    try:
+        path_parts = catalog_impl.split(".")
+        if len(path_parts) < 2:
+            raise ValueError(f"py-catalog-impl should be full path (module.CustomCatalog), got: {catalog_impl}")
+        module_name, class_name = ".".join(path_parts[:-1]), path_parts[-1]
+        module = importlib.import_module(module_name)
+        class_ = getattr(module, class_name)
+        return class_(name, **properties)
+    except ModuleNotFoundError:
+        logger.warning("Could not initialize Catalog: %s", catalog_impl)
+        return None
+
+
 @dataclass
 class PropertiesUpdateSummary:
     removed: List[str]
@@ -284,9 +339,6 @@ class Catalog(ABC):
     def __init__(self, name: str, **properties: str):
         self.name = name
         self.properties = properties
-
-    def _load_file_io(self, properties: Properties = EMPTY_DICT, location: Optional[str] = None) -> FileIO:
-        return load_file_io({**self.properties, **properties}, location)
 
     @abstractmethod
     def create_table(
@@ -316,6 +368,58 @@ class Catalog(ABC):
         """
 
     @abstractmethod
+    def create_table_transaction(
+        self,
+        identifier: Union[str, Identifier],
+        schema: Union[Schema, "pa.Schema"],
+        location: Optional[str] = None,
+        partition_spec: PartitionSpec = UNPARTITIONED_PARTITION_SPEC,
+        sort_order: SortOrder = UNSORTED_SORT_ORDER,
+        properties: Properties = EMPTY_DICT,
+    ) -> CreateTableTransaction:
+        """Create a CreateTableTransaction.
+
+        Args:
+            identifier (str | Identifier): Table identifier.
+            schema (Schema): Table's schema.
+            location (str | None): Location for the table. Optional Argument.
+            partition_spec (PartitionSpec): PartitionSpec for the table.
+            sort_order (SortOrder): SortOrder for the table.
+            properties (Properties): Table properties that can be a string based dictionary.
+
+        Returns:
+            CreateTableTransaction: createTableTransaction instance.
+        """
+
+    def create_table_if_not_exists(
+        self,
+        identifier: Union[str, Identifier],
+        schema: Union[Schema, "pa.Schema"],
+        location: Optional[str] = None,
+        partition_spec: PartitionSpec = UNPARTITIONED_PARTITION_SPEC,
+        sort_order: SortOrder = UNSORTED_SORT_ORDER,
+        properties: Properties = EMPTY_DICT,
+    ) -> Table:
+        """Create a table if it does not exist.
+
+        Args:
+            identifier (str | Identifier): Table identifier.
+            schema (Schema): Table's schema.
+            location (str | None): Location for the table. Optional Argument.
+            partition_spec (PartitionSpec): PartitionSpec for the table.
+            sort_order (SortOrder): SortOrder for the table.
+            properties (Properties): Table properties that can be a string based dictionary.
+
+        Returns:
+            Table: the created table instance if the table does not exist, else the existing
+            table instance.
+        """
+        try:
+            return self.create_table(identifier, schema, location, partition_spec, sort_order, properties)
+        except TableAlreadyExistsError:
+            return self.load_table(identifier)
+
+    @abstractmethod
     def load_table(self, identifier: Union[str, Identifier]) -> Table:
         """Load the table's metadata and returns the table instance.
 
@@ -330,6 +434,17 @@ class Catalog(ABC):
 
         Raises:
             NoSuchTableError: If a table with the name does not exist.
+        """
+
+    @abstractmethod
+    def table_exists(self, identifier: Union[str, Identifier]) -> bool:
+        """Check if a table exists.
+
+        Args:
+            identifier (str | Identifier): Table identifier.
+
+        Returns:
+            bool: True if the table exists, False otherwise.
         """
 
     @abstractmethod
@@ -359,6 +474,19 @@ class Catalog(ABC):
         """
 
     @abstractmethod
+    def purge_table(self, identifier: Union[str, Identifier]) -> None:
+        """Drop a table and purge all data and metadata files.
+
+        Note: This method only logs warning rather than raise exception when encountering file deletion failure.
+
+        Args:
+            identifier (str | Identifier): Table identifier.
+
+        Raises:
+            NoSuchTableError: If a table with the name does not exist, or the identifier is invalid.
+        """
+
+    @abstractmethod
     def rename_table(self, from_identifier: Union[str, Identifier], to_identifier: Union[str, Identifier]) -> Table:
         """Rename a fully classified table name.
 
@@ -385,6 +513,8 @@ class Catalog(ABC):
 
         Raises:
             NoSuchTableError: If a table with the given identifier does not exist.
+            CommitFailedException: Requirement not met, or a conflict with a concurrent commit.
+            CommitStateUnknownException: Failed due to an internal exception on the side of the catalog.
         """
 
     @abstractmethod
@@ -398,6 +528,18 @@ class Catalog(ABC):
         Raises:
             NamespaceAlreadyExistsError: If a namespace with the given name already exists.
         """
+
+    def create_namespace_if_not_exists(self, namespace: Union[str, Identifier], properties: Properties = EMPTY_DICT) -> None:
+        """Create a namespace if it does not exist.
+
+        Args:
+            namespace (str | Identifier): Namespace identifier.
+            properties (Properties): A string dictionary of properties for the given namespace.
+        """
+        try:
+            self.create_namespace(namespace, properties)
+        except NamespaceAlreadyExistsError:
+            pass
 
     @abstractmethod
     def drop_namespace(self, namespace: Union[str, Identifier]) -> None:
@@ -471,6 +613,44 @@ class Catalog(ABC):
             ValueError: If removals and updates have overlapping keys.
         """
 
+    @deprecated(
+        deprecated_in="0.8.0",
+        removed_in="0.9.0",
+        help_message="Support for parsing catalog level identifier in Catalog identifiers is deprecated. Please refer to the table using only its namespace and its table name.",
+    )
+    def identifier_to_tuple_without_catalog(self, identifier: Union[str, Identifier]) -> Identifier:
+        """Convert an identifier to a tuple and drop this catalog's name from the first element.
+
+        Args:
+            identifier (str | Identifier): Table identifier.
+
+        Returns:
+            Identifier: a tuple of strings with this catalog's name removed
+        """
+        identifier_tuple = Catalog.identifier_to_tuple(identifier)
+        if len(identifier_tuple) >= 3 and identifier_tuple[0] == self.name:
+            identifier_tuple = identifier_tuple[1:]
+        return identifier_tuple
+
+    def _identifier_to_tuple_without_catalog(self, identifier: Union[str, Identifier]) -> Identifier:
+        """Convert an identifier to a tuple and drop this catalog's name from the first element.
+
+        Args:
+            identifier (str | Identifier): Table identifier.
+
+        Returns:
+            Identifier: a tuple of strings with this catalog's name removed
+        """
+        identifier_tuple = Catalog.identifier_to_tuple(identifier)
+        if len(identifier_tuple) >= 3 and identifier_tuple[0] == self.name:
+            deprecation_message(
+                deprecated_in="0.8.0",
+                removed_in="0.9.0",
+                help_message="Support for parsing catalog level identifier in Catalog identifiers is deprecated. Please refer to the table using only its namespace and its table name.",
+            )
+            identifier_tuple = identifier_tuple[1:]
+        return identifier_tuple
+
     @staticmethod
     def identifier_to_tuple(identifier: Union[str, Identifier]) -> Identifier:
         """Parse an identifier to a tuple.
@@ -478,7 +658,7 @@ class Catalog(ABC):
         If the identifier is a string, it is split into a tuple on '.'. If it is a tuple, it is used as-is.
 
         Args:
-            identifier (str | Identifier: an identifier, either a string or tuple of strings.
+            identifier (str | Identifier): an identifier, either a string or tuple of strings.
 
         Returns:
             Identifier: a tuple of strings.
@@ -510,44 +690,27 @@ class Catalog(ABC):
         return Catalog.identifier_to_tuple(identifier)[:-1]
 
     @staticmethod
-    def _check_for_overlap(removals: Optional[Set[str]], updates: Properties) -> None:
-        if updates and removals:
-            overlap = set(removals) & set(updates.keys())
-            if overlap:
-                raise ValueError(f"Updates and deletes have an overlap: {overlap}")
+    def namespace_to_string(
+        identifier: Union[str, Identifier], err: Union[Type[ValueError], Type[NoSuchNamespaceError]] = ValueError
+    ) -> str:
+        """Transform a namespace identifier into a string.
 
-    @staticmethod
-    def _convert_schema_if_needed(schema: Union[Schema, "pa.Schema"]) -> Schema:
-        if isinstance(schema, Schema):
-            return schema
-        try:
-            import pyarrow as pa
+        Args:
+            identifier (Union[str, Identifier]): a namespace identifier.
+            err (Union[Type[ValueError], Type[NoSuchNamespaceError]]): the error type to raise when identifier is empty.
 
-            from pyiceberg.io.pyarrow import _ConvertToIcebergWithoutIDs, visit_pyarrow
+        Returns:
+            Identifier: Namespace identifier.
+        """
+        tuple_identifier = Catalog.identifier_to_tuple(identifier)
+        if len(tuple_identifier) < 1:
+            raise err("Empty namespace identifier")
 
-            if isinstance(schema, pa.Schema):
-                schema: Schema = visit_pyarrow(schema, _ConvertToIcebergWithoutIDs())  # type: ignore
-                return schema
-        except ModuleNotFoundError:
-            pass
-        raise ValueError(f"{type(schema)=}, but it must be pyiceberg.schema.Schema or pyarrow.Schema")
+        # Check if any segment of the tuple is an empty string
+        if any(segment.strip() == "" for segment in tuple_identifier):
+            raise err("Namespace identifier contains an empty segment or a segment with only whitespace")
 
-    def _resolve_table_location(self, location: Optional[str], database_name: str, table_name: str) -> str:
-        if not location:
-            return self._get_default_warehouse_location(database_name, table_name)
-        return location
-
-    def _get_default_warehouse_location(self, database_name: str, table_name: str) -> str:
-        database_properties = self.load_namespace_properties(database_name)
-        if database_location := database_properties.get(LOCATION):
-            database_location = database_location.rstrip("/")
-            return f"{database_location}/{table_name}"
-
-        if warehouse_path := self.properties.get(WAREHOUSE_LOCATION):
-            warehouse_path = warehouse_path.rstrip("/")
-            return f"{warehouse_path}/{database_name}.db/{table_name}"
-
-        raise ValueError("No default path is set, please specify a location when creating a table")
+        return ".".join(segment.strip() for segment in tuple_identifier)
 
     @staticmethod
     def identifier_to_database(
@@ -570,32 +733,67 @@ class Catalog(ABC):
 
         return tuple_identifier[0], tuple_identifier[1]
 
-    def identifier_to_tuple_without_catalog(self, identifier: Union[str, Identifier]) -> Identifier:
-        """Convert an identifier to a tuple and drop this catalog's name from the first element.
+    def _load_file_io(self, properties: Properties = EMPTY_DICT, location: Optional[str] = None) -> FileIO:
+        return load_file_io({**self.properties, **properties}, location)
 
-        Args:
-            identifier (str | Identifier): Table identifier.
+    @staticmethod
+    def _convert_schema_if_needed(schema: Union[Schema, "pa.Schema"]) -> Schema:
+        if isinstance(schema, Schema):
+            return schema
+        try:
+            import pyarrow as pa
 
-        Returns:
-            Identifier: a tuple of strings with this catalog's name removed
-        """
-        identifier_tuple = Catalog.identifier_to_tuple(identifier)
-        if len(identifier_tuple) >= 3 and identifier_tuple[0] == self.name:
-            identifier_tuple = identifier_tuple[1:]
-        return identifier_tuple
+            from pyiceberg.io.pyarrow import _ConvertToIcebergWithoutIDs, visit_pyarrow
+
+            downcast_ns_timestamp_to_us = Config().get_bool(DOWNCAST_NS_TIMESTAMP_TO_US_ON_WRITE) or False
+            if isinstance(schema, pa.Schema):
+                schema: Schema = visit_pyarrow(  # type: ignore
+                    schema, _ConvertToIcebergWithoutIDs(downcast_ns_timestamp_to_us=downcast_ns_timestamp_to_us)
+                )
+                return schema
+        except ModuleNotFoundError:
+            pass
+        raise ValueError(f"{type(schema)=}, but it must be pyiceberg.schema.Schema or pyarrow.Schema")
+
+    def __repr__(self) -> str:
+        """Return the string representation of the Catalog class."""
+        return f"{self.name} ({self.__class__})"
+
+
+class MetastoreCatalog(Catalog, ABC):
+    def __init__(self, name: str, **properties: str):
+        super().__init__(name, **properties)
+
+        for property_name in DEPRECATED_PROPERTY_NAMES:
+            if self.properties.get(property_name):
+                deprecation_message(
+                    deprecated_in="0.7.0",
+                    removed_in="0.8.0",
+                    help_message=f"The property {property_name} is deprecated. Please use properties that start with client., glue., and dynamo. instead",
+                )
+
+    def create_table_transaction(
+        self,
+        identifier: Union[str, Identifier],
+        schema: Union[Schema, "pa.Schema"],
+        location: Optional[str] = None,
+        partition_spec: PartitionSpec = UNPARTITIONED_PARTITION_SPEC,
+        sort_order: SortOrder = UNSORTED_SORT_ORDER,
+        properties: Properties = EMPTY_DICT,
+    ) -> CreateTableTransaction:
+        return CreateTableTransaction(
+            self._create_staged_table(identifier, schema, location, partition_spec, sort_order, properties)
+        )
+
+    def table_exists(self, identifier: Union[str, Identifier]) -> bool:
+        try:
+            self.load_table(identifier)
+            return True
+        except NoSuchTableError:
+            return False
 
     def purge_table(self, identifier: Union[str, Identifier]) -> None:
-        """Drop a table and purge all data and metadata files.
-
-        Note: This method only logs warning rather than raise exception when encountering file deletion failure.
-
-        Args:
-            identifier (str | Identifier): Table identifier.
-
-        Raises:
-            NoSuchTableError: If a table with the name does not exist, or the identifier is invalid.
-        """
-        identifier_tuple = self.identifier_to_tuple_without_catalog(identifier)
+        identifier_tuple = self._identifier_to_tuple_without_catalog(identifier)
         table = self.load_table(identifier_tuple)
         self.drop_table(identifier_tuple)
         io = load_file_io(self.properties, table.metadata_location)
@@ -615,6 +813,111 @@ class Catalog(ABC):
         delete_files(io, manifest_lists_to_delete, MANIFEST_LIST)
         delete_files(io, prev_metadata_files, PREVIOUS_METADATA)
         delete_files(io, {table.metadata_location}, METADATA)
+
+    def _create_staged_table(
+        self,
+        identifier: Union[str, Identifier],
+        schema: Union[Schema, "pa.Schema"],
+        location: Optional[str] = None,
+        partition_spec: PartitionSpec = UNPARTITIONED_PARTITION_SPEC,
+        sort_order: SortOrder = UNSORTED_SORT_ORDER,
+        properties: Properties = EMPTY_DICT,
+    ) -> StagedTable:
+        """Create a table and return the table instance without committing the changes.
+
+        Args:
+            identifier (str | Identifier): Table identifier.
+            schema (Schema): Table's schema.
+            location (str | None): Location for the table. Optional Argument.
+            partition_spec (PartitionSpec): PartitionSpec for the table.
+            sort_order (SortOrder): SortOrder for the table.
+            properties (Properties): Table properties that can be a string based dictionary.
+
+        Returns:
+            StagedTable: the created staged table instance.
+        """
+        schema: Schema = self._convert_schema_if_needed(schema)  # type: ignore
+
+        database_name, table_name = self.identifier_to_database_and_table(identifier)
+
+        location = self._resolve_table_location(location, database_name, table_name)
+        metadata_location = self._get_metadata_location(location=location)
+        metadata = new_table_metadata(
+            location=location, schema=schema, partition_spec=partition_spec, sort_order=sort_order, properties=properties
+        )
+        io = self._load_file_io(properties=properties, location=metadata_location)
+        return StagedTable(
+            identifier=(database_name, table_name),
+            metadata=metadata,
+            metadata_location=metadata_location,
+            io=io,
+            catalog=self,
+        )
+
+    def _update_and_stage_table(self, current_table: Optional[Table], table_request: CommitTableRequest) -> StagedTable:
+        for requirement in table_request.requirements:
+            requirement.validate(current_table.metadata if current_table else None)
+
+        updated_metadata = update_table_metadata(
+            base_metadata=current_table.metadata if current_table else self._empty_table_metadata(),
+            updates=table_request.updates,
+            enforce_validation=current_table is None,
+            metadata_location=current_table.metadata_location if current_table else None,
+        )
+
+        new_metadata_version = self._parse_metadata_version(current_table.metadata_location) + 1 if current_table else 0
+        new_metadata_location = self._get_metadata_location(updated_metadata.location, new_metadata_version)
+
+        return StagedTable(
+            identifier=tuple(table_request.identifier.namespace.root + [table_request.identifier.name]),
+            metadata=updated_metadata,
+            metadata_location=new_metadata_location,
+            io=self._load_file_io(properties=updated_metadata.properties, location=new_metadata_location),
+            catalog=self,
+        )
+
+    def _get_updated_props_and_update_summary(
+        self, current_properties: Properties, removals: Optional[Set[str]], updates: Properties
+    ) -> Tuple[PropertiesUpdateSummary, Properties]:
+        self._check_for_overlap(updates=updates, removals=removals)
+        updated_properties = dict(current_properties)
+
+        removed: Set[str] = set()
+        updated: Set[str] = set()
+
+        if removals:
+            for key in removals:
+                if key in updated_properties:
+                    updated_properties.pop(key)
+                    removed.add(key)
+        if updates:
+            for key, value in updates.items():
+                updated_properties[key] = value
+                updated.add(key)
+
+        expected_to_change = (removals or set()).difference(removed)
+        properties_update_summary = PropertiesUpdateSummary(
+            removed=list(removed or []), updated=list(updated or []), missing=list(expected_to_change)
+        )
+
+        return properties_update_summary, updated_properties
+
+    def _resolve_table_location(self, location: Optional[str], database_name: str, table_name: str) -> str:
+        if not location:
+            return self._get_default_warehouse_location(database_name, table_name)
+        return location.rstrip("/")
+
+    def _get_default_warehouse_location(self, database_name: str, table_name: str) -> str:
+        database_properties = self.load_namespace_properties(database_name)
+        if database_location := database_properties.get(LOCATION):
+            database_location = database_location.rstrip("/")
+            return f"{database_location}/{table_name}"
+
+        if warehouse_path := self.properties.get(WAREHOUSE_LOCATION):
+            warehouse_path = warehouse_path.rstrip("/")
+            return f"{warehouse_path}/{database_name}.db/{table_name}"
+
+        raise ValueError("No default path is set, please specify a location when creating a table")
 
     @staticmethod
     def _write_metadata(metadata: TableMetadata, io: FileIO, metadata_path: str) -> None:
@@ -654,32 +957,22 @@ class Catalog(ABC):
         else:
             return -1
 
-    def _get_updated_props_and_update_summary(
-        self, current_properties: Properties, removals: Optional[Set[str]], updates: Properties
-    ) -> Tuple[PropertiesUpdateSummary, Properties]:
-        self._check_for_overlap(updates=updates, removals=removals)
-        updated_properties = dict(current_properties)
+    @staticmethod
+    def _check_for_overlap(removals: Optional[Set[str]], updates: Properties) -> None:
+        if updates and removals:
+            overlap = set(removals) & set(updates.keys())
+            if overlap:
+                raise ValueError(f"Updates and deletes have an overlap: {overlap}")
 
-        removed: Set[str] = set()
-        updated: Set[str] = set()
+    @staticmethod
+    def _empty_table_metadata() -> TableMetadata:
+        """Return an empty TableMetadata instance.
 
-        if removals:
-            for key in removals:
-                if key in updated_properties:
-                    updated_properties.pop(key)
-                    removed.add(key)
-        if updates:
-            for key, value in updates.items():
-                updated_properties[key] = value
-                updated.add(key)
+        It is used to build a TableMetadata from a sequence of initial TableUpdates.
+        It is a V1 TableMetadata because there will be a UpgradeFormatVersionUpdate in
+        initial changes to bump the metadata to the target version.
 
-        expected_to_change = (removals or set()).difference(removed)
-        properties_update_summary = PropertiesUpdateSummary(
-            removed=list(removed or []), updated=list(updated or []), missing=list(expected_to_change)
-        )
-
-        return properties_update_summary, updated_properties
-
-    def __repr__(self) -> str:
-        """Return the string representation of the Catalog class."""
-        return f"{self.name} ({self.__class__})"
+        Returns:
+            TableMetadata: An empty TableMetadata instance.
+        """
+        return TableMetadataV1(location="", last_column_id=-1, schema=Schema())

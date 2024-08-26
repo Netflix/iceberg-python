@@ -23,6 +23,31 @@ The guide to release PyIceberg.
 
 The first step is to publish a release candidate (RC) and publish it to the public for testing and validation. Once the vote has passed on the RC, the RC turns into the new release.
 
+## Preparing for a release
+
+Before running the release candidate, we want to remove any APIs that were marked for removal under the @deprecated tag for this release.
+
+For example, the API with the following deprecation tag should be removed when preparing for the 0.2.0 release.
+
+```python
+
+@deprecated(
+    deprecated_in="0.1.0",
+    removed_in="0.2.0",
+    help_message="Please use load_something_else() instead",
+)
+```
+
+We also have the `deprecation_message` function. We need to change the behavior according to what is noted in the message of that deprecation.
+
+```python
+deprecation_message(
+    deprecated_in="0.1.0",
+    removed_in="0.2.0",
+    help_message="The old_property is deprecated. Please use the something_else property instead.",
+)
+```
+
 ## Running a release candidate
 
 Make sure that the version is correct in `pyproject.toml` and `pyiceberg/__init__.py`. Correct means that it reflects the version that you want to release.
@@ -43,7 +68,7 @@ Set the tag on the last commit:
 
 ```bash
 export RC=rc1
-export VERSION=0.1.0${RC}
+export VERSION=0.7.0${RC}
 export VERSION_WITHOUT_RC=${VERSION/rc?/}
 export VERSION_BRANCH=${VERSION_WITHOUT_RC//./-}
 export GIT_TAG=pyiceberg-${VERSION}
@@ -56,7 +81,17 @@ export GIT_TAG_HASH=${GIT_TAG_REF:0:40}
 export LAST_COMMIT_ID=$(git rev-list ${GIT_TAG} 2> /dev/null | head -n 1)
 ```
 
-The `-s` option will sign the commit. If you don't have a key yet, you can find the instructions [here](http://www.apache.org/dev/openpgp.html#key-gen-generate-key). To install gpg on a M1 based Mac, a couple of additional steps are required: https://gist.github.com/phortuin/cf24b1cca3258720c71ad42977e1ba57
+The `-s` option will sign the commit. If you don't have a key yet, you can find the instructions [here](http://www.apache.org/dev/openpgp.html#key-gen-generate-key). To install gpg on a M1 based Mac, a couple of additional steps are required: https://gist.github.com/phortuin/cf24b1cca3258720c71ad42977e1ba57.
+If you have not published your GPG key in [KEYS](https://dist.apache.org/repos/dist/dev/iceberg/KEYS) yet, you must publish it before sending the vote email by doing:
+
+```bash
+svn co https://dist.apache.org/repos/dist/dev/iceberg icebergsvn
+cd icebergsvn
+echo "" >> KEYS # append a newline
+gpg --list-sigs <YOUR KEY ID HERE> >> KEYS # append signatures
+gpg --armor --export <YOUR KEY ID HERE> >> KEYS # append public key block
+svn commit -m "add key for <YOUR NAME HERE>"
+```
 
 ### Upload to Apache SVN
 
@@ -64,7 +99,11 @@ Both the source distribution (`sdist`) and the binary distributions (`wheels`) n
 
 Before committing the files to the Apache SVN artifact distribution SVN hashes need to be generated, and those need to be signed with gpg to make sure that they are authentic.
 
-Go to [Github Actions and run the `Python release` action](https://github.com/apache/iceberg-python/actions/workflows/python-release.yml). **Set the version to main, since we cannot modify the source**. Download the zip, and sign the files:
+Go to [Github Actions and run the `Python release` action](https://github.com/apache/iceberg-python/actions/workflows/python-release.yml). **Set the version to main, since we cannot modify the source**.
+
+![Github Actions Run Workflow for SVN Upload](assets/images/ghactions-run-workflow-svn-upload.png)
+
+Download the zip, and sign the files:
 
 ```bash
 cd release-main/
@@ -91,12 +130,14 @@ svn ci -m "PyIceberg ${VERSION}" ${SVN_TMP_DIR_VERSIONED}
 
 ### Upload to PyPi
 
-Go to Github Actions and run the `Python release` action. Set the version of the release candidate as the input: `0.1.0rc1`. Download the zip and unzip it locally.
+Go to Github Actions and run the `Python release` action again. This time, set the **version** of the release candidate as the input: e.g. `0.7.0rc1`. Download the zip and unzip it locally.
+
+![Github Actions Run Workflow for PyPi Upload](assets/images/ghactions-run-workflow-pypi-upload.png)
 
 Next step is to upload them to pypi. Please keep in mind that this **won't** bump the version for everyone that hasn't pinned their version, since it is set to an RC [pre-release and those are ignored](https://packaging.python.org/en/latest/guides/distributing-packages-using-setuptools/#pre-release-versioning).
 
 ```bash
-twine upload -s release-0.1.0rc1/*
+twine upload release-0.7.0rc1/*
 ```
 
 Final step is to generate the email to the dev mail list:
@@ -133,6 +174,10 @@ https://pypi.org/project/pyiceberg/$VERSION/
 
 And can be installed using: pip3 install pyiceberg==$VERSION
 
+Instructions for verifying a release can be found here:
+
+* https://py.iceberg.apache.org/verify-release/
+
 Please download, verify, and test.
 
 Please vote in the next 72 hours.
@@ -163,20 +208,31 @@ Kind regards,
 ### Copy the artifacts to the release dist
 
 ```
-svn checkout https://dist.apache.org/repos/dist/dev/iceberg /tmp/iceberg-dist-dev
-svn checkout https://dist.apache.org/repos/dist/release/iceberg/ /tmp/iceberg-dist-release
+export RC=rc2
+export VERSION=0.7.0${RC}
+export VERSION_WITHOUT_RC=${VERSION/rc?/}
 
-mkdir -p /tmp/iceberg-dist-release/pyiceberg-<VERSION>
-cp -r /tmp/iceberg-dist-dev/pyiceberg-<VERSION>rcN/* /tmp/iceberg-dist-release/pyiceberg-<VERSION>
+export SVN_DEV_DIR_VERSIONED="https://dist.apache.org/repos/dist/dev/iceberg/pyiceberg-${VERSION}"
+export SVN_RELEASE_DIR_VERSIONED="https://dist.apache.org/repos/dist/release/iceberg/pyiceberg-${VERSION_WITHOUT_RC}"
 
-svn add /tmp/iceberg-dist-release/
-svn ci -m "PyIceberg <VERSION>" /tmp/iceberg-dist-release/
+svn mv ${SVN_DEV_DIR_VERSIONED} ${SVN_RELEASE_DIR_VERSIONED} -m "PyIceberg: Add release ${VERSION_WITHOUT_RC}"
 ```
+
+<!-- prettier-ignore-start -->
+
+!!! note
+    Only a PMC member has the permission to upload an artifact to the SVN release dist.
+
+<!-- prettier-ignore-end -->
+
+### Upload the accepted release to PyPi
 
 The latest version can be pushed to PyPi. Check out the Apache SVN and make sure to publish the right version with `twine`:
 
 ```bash
-twine upload -s /tmp/iceberg-dist-release/pyiceberg-<VERSION>/*
+svn checkout https://dist.apache.org/repos/dist/release/iceberg /tmp/iceberg-dist-release/
+cd /tmp/iceberg-dist-release/pyiceberg-${VERSION_WITHOUT_RC}
+twine upload pyiceberg-*.whl pyiceberg-*.tar.gz
 ```
 
 Send out an announcement on the dev mail list:
@@ -200,3 +256,25 @@ Thanks to everyone for contributing!
 ## Release the docs
 
 A committer triggers the [`Python Docs` Github Actions](https://github.com/apache/iceberg-python/actions/workflows/python-ci-docs.yml) through the UI by selecting the branch that just has been released. This will publish the new docs.
+
+## Update the Github template
+
+Make sure to create a PR to update the [GitHub issues template](https://github.com/apache/iceberg-python/blob/main/.github/ISSUE_TEMPLATE/iceberg_bug_report.yml) with the latest version.
+
+## Update the integration tests
+
+Ensure to update the `PYICEBERG_VERSION` in the [Dockerfile](https://github.com/apache/iceberg-python/blob/main/dev/Dockerfile).
+
+## Create a Github Release Note
+
+Create a [new Release Note](https://github.com/apache/iceberg-python/releases/new) on the iceberg-python Github repository.
+
+Input the tag in **Choose a tag** with the newly approved released version (e.g. `0.7.0`) and set it to **Create new tag** on publish. Pick the target commit version as the commit ID the release was approved on.
+For example:
+![Generate Release Notes](assets/images/gen-release-notes.jpg)
+
+Then, select the previous release version as the **Previous tag** to use the diff between the two versions in generating the release notes.
+
+**Generate release notes**.
+
+**Set as the latest release** and **Publish**.

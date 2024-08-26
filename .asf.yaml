@@ -44,7 +44,7 @@ github:
     projects: true
   collaborators:  # Note: the number of collaborators is limited to 10
     - ajantha-bhat
-    - syun64
+    - ndrluis
   ghp_branch: gh-pages
   ghp_path: /
 

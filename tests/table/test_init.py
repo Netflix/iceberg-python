@@ -17,9 +17,10 @@
 # pylint:disable=redefined-outer-name
 import uuid
 from copy import copy
-from typing import Dict
+from typing import Any, Dict
 
 import pytest
+from pydantic import ValidationError
 from sortedcontainers import SortedList
 
 from pyiceberg.catalog.noop import NoopCatalog
@@ -42,6 +43,7 @@ from pyiceberg.partitioning import PartitionField, PartitionSpec
 from pyiceberg.schema import Schema
 from pyiceberg.table import (
     AddSnapshotUpdate,
+    AddSortOrderUpdate,
     AssertCreate,
     AssertCurrentSchemaId,
     AssertDefaultSortOrderId,
@@ -50,25 +52,29 @@ from pyiceberg.table import (
     AssertLastAssignedPartitionId,
     AssertRefSnapshotId,
     AssertTableUUID,
+    CommitTableRequest,
     RemovePropertiesUpdate,
+    SetDefaultSortOrderUpdate,
     SetPropertiesUpdate,
     SetSnapshotRefUpdate,
-    SnapshotRef,
     StaticTable,
     Table,
+    TableIdentifier,
     UpdateSchema,
     _apply_table_update,
-    _generate_snapshot_id,
     _match_deletes_to_data_file,
     _TableMetadataUpdateContext,
     update_table_metadata,
 )
-from pyiceberg.table.metadata import INITIAL_SEQUENCE_NUMBER, TableMetadataUtil, TableMetadataV2
+from pyiceberg.table.metadata import INITIAL_SEQUENCE_NUMBER, TableMetadataUtil, TableMetadataV2, _generate_snapshot_id
+from pyiceberg.table.refs import SnapshotRef
 from pyiceberg.table.snapshots import (
+    MetadataLogEntry,
     Operation,
     Snapshot,
     SnapshotLogEntry,
     Summary,
+    ancestors_of,
 )
 from pyiceberg.table.sorting import (
     NullOrder,
@@ -76,12 +82,17 @@ from pyiceberg.table.sorting import (
     SortField,
     SortOrder,
 )
-from pyiceberg.transforms import BucketTransform, IdentityTransform
+from pyiceberg.transforms import (
+    BucketTransform,
+    IdentityTransform,
+)
 from pyiceberg.types import (
     BinaryType,
     BooleanType,
     DateType,
+    DecimalType,
     DoubleType,
+    FixedType,
     FloatType,
     IntegerType,
     ListType,
@@ -103,26 +114,26 @@ def test_schema(table_v2: Table) -> None:
         NestedField(field_id=1, name="x", field_type=LongType(), required=True),
         NestedField(field_id=2, name="y", field_type=LongType(), required=True, doc="comment"),
         NestedField(field_id=3, name="z", field_type=LongType(), required=True),
-        schema_id=1,
         identifier_field_ids=[1, 2],
     )
+    assert table_v2.schema().schema_id == 1
 
 
 def test_schemas(table_v2: Table) -> None:
     assert table_v2.schemas() == {
         0: Schema(
             NestedField(field_id=1, name="x", field_type=LongType(), required=True),
-            schema_id=0,
             identifier_field_ids=[],
         ),
         1: Schema(
             NestedField(field_id=1, name="x", field_type=LongType(), required=True),
             NestedField(field_id=2, name="y", field_type=LongType(), required=True, doc="comment"),
             NestedField(field_id=3, name="z", field_type=LongType(), required=True),
-            schema_id=1,
             identifier_field_ids=[1, 2],
         ),
     }
+    assert table_v2.schemas()[0].schema_id == 0
+    assert table_v2.schemas()[1].schema_id == 1
 
 
 def test_spec(table_v2: Table) -> None:
@@ -190,6 +201,57 @@ def test_snapshot_by_id(table_v2: Table) -> None:
         manifest_list="s3://a/b/2.avro",
         summary=Summary(operation=Operation.APPEND),
         schema_id=1,
+    )
+
+
+def test_snapshot_by_timestamp(table_v2: Table) -> None:
+    assert table_v2.snapshot_as_of_timestamp(1515100955770) == Snapshot(
+        snapshot_id=3051729675574597004,
+        parent_snapshot_id=None,
+        sequence_number=0,
+        timestamp_ms=1515100955770,
+        manifest_list="s3://a/b/1.avro",
+        summary=Summary(Operation.APPEND),
+        schema_id=None,
+    )
+    assert table_v2.snapshot_as_of_timestamp(1515100955770, inclusive=False) is None
+
+
+def test_ancestors_of(table_v2: Table) -> None:
+    assert list(ancestors_of(table_v2.current_snapshot(), table_v2.metadata)) == [
+        Snapshot(
+            snapshot_id=3055729675574597004,
+            parent_snapshot_id=3051729675574597004,
+            sequence_number=1,
+            timestamp_ms=1555100955770,
+            manifest_list="s3://a/b/2.avro",
+            summary=Summary(Operation.APPEND),
+            schema_id=1,
+        ),
+        Snapshot(
+            snapshot_id=3051729675574597004,
+            parent_snapshot_id=None,
+            sequence_number=0,
+            timestamp_ms=1515100955770,
+            manifest_list="s3://a/b/1.avro",
+            summary=Summary(Operation.APPEND),
+            schema_id=None,
+        ),
+    ]
+
+
+def test_ancestors_of_recursive_error(table_v2_with_extensive_snapshots: Table) -> None:
+    # Test RecursionError: maximum recursion depth exceeded
+    assert (
+        len(
+            list(
+                ancestors_of(
+                    table_v2_with_extensive_snapshots.current_snapshot(),
+                    table_v2_with_extensive_snapshots.metadata,
+                )
+            )
+        )
+        == 2000
     )
 
 
@@ -262,31 +324,34 @@ def test_table_scan_ref_does_not_exists(table_v2: Table) -> None:
 
 def test_table_scan_projection_full_schema(table_v2: Table) -> None:
     scan = table_v2.scan()
-    assert scan.select("x", "y", "z").projection() == Schema(
+    projection_schema = scan.select("x", "y", "z").projection()
+    assert projection_schema == Schema(
         NestedField(field_id=1, name="x", field_type=LongType(), required=True),
         NestedField(field_id=2, name="y", field_type=LongType(), required=True, doc="comment"),
         NestedField(field_id=3, name="z", field_type=LongType(), required=True),
-        schema_id=1,
         identifier_field_ids=[1, 2],
     )
+    assert projection_schema.schema_id == 1
 
 
 def test_table_scan_projection_single_column(table_v2: Table) -> None:
     scan = table_v2.scan()
-    assert scan.select("y").projection() == Schema(
+    projection_schema = scan.select("y").projection()
+    assert projection_schema == Schema(
         NestedField(field_id=2, name="y", field_type=LongType(), required=True, doc="comment"),
-        schema_id=1,
         identifier_field_ids=[2],
     )
+    assert projection_schema.schema_id == 1
 
 
 def test_table_scan_projection_single_column_case_sensitive(table_v2: Table) -> None:
     scan = table_v2.scan()
-    assert scan.with_case_sensitive(False).select("Y").projection() == Schema(
+    projection_schema = scan.with_case_sensitive(False).select("Y").projection()
+    assert projection_schema == Schema(
         NestedField(field_id=2, name="y", field_type=LongType(), required=True, doc="comment"),
-        schema_id=1,
         identifier_field_ids=[2],
     )
+    assert projection_schema.schema_id == 1
 
 
 def test_table_scan_projection_unknown_column(table_v2: Table) -> None:
@@ -431,7 +496,7 @@ def test_serialize_set_properties_updates() -> None:
 
 
 def test_add_column(table_v2: Table) -> None:
-    update = UpdateSchema(table_v2)
+    update = UpdateSchema(transaction=table_v2.transaction())
     update.add_column(path="b", field_type=IntegerType())
     apply_schema: Schema = update._apply()  # pylint: disable=W0212
     assert len(apply_schema.fields) == 4
@@ -445,6 +510,41 @@ def test_add_column(table_v2: Table) -> None:
     )
     assert apply_schema.schema_id == 2
     assert apply_schema.highest_field_id == 4
+
+
+def test_update_column(table_v1: Table, table_v2: Table) -> None:
+    """
+    Table should be able to update existing property `doc`
+    Table should also be able to update property `required`, if the field is not an identifier field.
+    """
+    COMMENT2 = "comment2"
+    for table in [table_v1, table_v2]:
+        original_schema = table.schema()
+        # update existing doc to a new doc
+        assert original_schema.find_field("y").doc == "comment"
+        new_schema = table.transaction().update_schema().update_column("y", doc=COMMENT2)._apply()
+        assert new_schema.find_field("y").doc == COMMENT2, "failed to update existing field doc"
+
+        # update existing doc to an emtpy string
+        assert new_schema.find_field("y").doc == COMMENT2
+        new_schema2 = table.transaction().update_schema().update_column("y", doc="")._apply()
+        assert new_schema2.find_field("y").doc == "", "failed to remove existing field doc"
+
+        # update required to False
+        assert original_schema.find_field("z").required is True
+        new_schema3 = table.transaction().update_schema().update_column("z", required=False)._apply()
+        assert new_schema3.find_field("z").required is False, "failed to update existing field required"
+
+        # assert the above two updates also works with union_by_name
+        assert (
+            table.update_schema().union_by_name(new_schema)._apply() == new_schema
+        ), "failed to update existing field doc with union_by_name"
+        assert (
+            table.update_schema().union_by_name(new_schema2)._apply() == new_schema2
+        ), "failed to remove existing field doc with union_by_name"
+        assert (
+            table.update_schema().union_by_name(new_schema3)._apply() == new_schema3
+        ), "failed to update existing field required with union_by_name"
 
 
 def test_add_primitive_type_column(table_v2: Table) -> None:
@@ -465,7 +565,7 @@ def test_add_primitive_type_column(table_v2: Table) -> None:
 
     for name, type_ in primitive_type.items():
         field_name = f"new_column_{name}"
-        update = UpdateSchema(table_v2)
+        update = UpdateSchema(transaction=table_v2.transaction())
         update.add_column(path=field_name, field_type=type_, doc=f"new_column_{name}")
         new_schema = update._apply()  # pylint: disable=W0212
 
@@ -477,7 +577,7 @@ def test_add_primitive_type_column(table_v2: Table) -> None:
 def test_add_nested_type_column(table_v2: Table) -> None:
     # add struct type column
     field_name = "new_column_struct"
-    update = UpdateSchema(table_v2)
+    update = UpdateSchema(transaction=table_v2.transaction())
     struct_ = StructType(
         NestedField(1, "lat", DoubleType()),
         NestedField(2, "long", DoubleType()),
@@ -495,7 +595,7 @@ def test_add_nested_type_column(table_v2: Table) -> None:
 def test_add_nested_map_type_column(table_v2: Table) -> None:
     # add map type column
     field_name = "new_column_map"
-    update = UpdateSchema(table_v2)
+    update = UpdateSchema(transaction=table_v2.transaction())
     map_ = MapType(1, StringType(), 2, IntegerType(), False)
     update.add_column(path=field_name, field_type=map_)
     new_schema = update._apply()  # pylint: disable=W0212
@@ -507,7 +607,7 @@ def test_add_nested_map_type_column(table_v2: Table) -> None:
 def test_add_nested_list_type_column(table_v2: Table) -> None:
     # add list type column
     field_name = "new_column_list"
-    update = UpdateSchema(table_v2)
+    update = UpdateSchema(transaction=table_v2.transaction())
     list_ = ListType(
         element_id=101,
         element_type=StructType(
@@ -551,6 +651,7 @@ def test_apply_set_properties_update(table_v2: Table) -> None:
         "test_b": "test_b",
         "test_c": "test_c",
     }
+    assert new_metadata_add_only.last_updated_ms > base_metadata.last_updated_ms
 
 
 def test_apply_remove_properties_update(table_v2: Table) -> None:
@@ -625,7 +726,7 @@ def test_update_metadata_add_snapshot(table_v2: Table) -> None:
         snapshot_id=25,
         parent_snapshot_id=19,
         sequence_number=200,
-        timestamp_ms=1602638573590,
+        timestamp_ms=1602638593590,
         manifest_list="s3:/a/b/c.avro",
         summary=Summary(Operation.APPEND),
         schema_id=3,
@@ -636,6 +737,30 @@ def test_update_metadata_add_snapshot(table_v2: Table) -> None:
     assert new_metadata.snapshots[-1] == new_snapshot
     assert new_metadata.last_sequence_number == new_snapshot.sequence_number
     assert new_metadata.last_updated_ms == new_snapshot.timestamp_ms
+
+
+def test_update_metadata_set_ref_snapshot(table_v2: Table) -> None:
+    update, _ = table_v2.transaction()._set_ref_snapshot(
+        snapshot_id=3051729675574597004,
+        ref_name="main",
+        type="branch",
+        max_ref_age_ms=123123123,
+        max_snapshot_age_ms=12312312312,
+        min_snapshots_to_keep=1,
+    )
+
+    new_metadata = update_table_metadata(table_v2.metadata, update)
+    assert len(new_metadata.snapshot_log) == 3
+    assert new_metadata.snapshot_log[2].snapshot_id == 3051729675574597004
+    assert new_metadata.current_snapshot_id == 3051729675574597004
+    assert new_metadata.last_updated_ms > table_v2.metadata.last_updated_ms
+    assert new_metadata.refs["main"] == SnapshotRef(
+        snapshot_id=3051729675574597004,
+        snapshot_ref_type="branch",
+        min_snapshots_to_keep=1,
+        max_snapshot_age_ms=12312312312,
+        max_ref_age_ms=123123123,
+    )
 
 
 def test_update_metadata_set_snapshot_ref(table_v2: Table) -> None:
@@ -660,6 +785,27 @@ def test_update_metadata_set_snapshot_ref(table_v2: Table) -> None:
         max_snapshot_age_ms=12312312312,
         max_ref_age_ms=123123123,
     )
+
+
+def test_update_metadata_add_update_sort_order(table_v2: Table) -> None:
+    new_sort_order = SortOrder(order_id=table_v2.sort_order().order_id + 1)
+    new_metadata = update_table_metadata(
+        table_v2.metadata,
+        (AddSortOrderUpdate(sort_order=new_sort_order), SetDefaultSortOrderUpdate(sort_order_id=-1)),
+    )
+    assert len(new_metadata.sort_orders) == 2
+    assert new_metadata.sort_orders[-1] == new_sort_order
+    assert new_metadata.default_sort_order_id == new_sort_order.order_id
+    assert new_metadata.last_updated_ms > table_v2.metadata.last_updated_ms
+
+
+def test_update_metadata_update_sort_order_invalid(table_v2: Table) -> None:
+    with pytest.raises(ValueError, match="Cannot set current sort order to the last added one when no sort order has been added"):
+        update_table_metadata(table_v2.metadata, (SetDefaultSortOrderUpdate(sort_order_id=-1),))
+
+    invalid_order_id = 10
+    with pytest.raises(ValueError, match=f"Sort order with id {invalid_order_id} does not exist"):
+        update_table_metadata(table_v2.metadata, (SetDefaultSortOrderUpdate(sort_order_id=invalid_order_id),))
 
 
 def test_update_metadata_with_multiple_updates(table_v1: Table) -> None:
@@ -735,6 +881,32 @@ def test_update_metadata_with_multiple_updates(table_v1: Table) -> None:
     assert new_metadata.properties == {"owner": "test", "test_a": "test_a1"}
 
 
+def test_update_metadata_schema_immutability(
+    table_v2_with_fixed_and_decimal_types: TableMetadataV2,
+) -> None:
+    update = SetSnapshotRefUpdate(
+        ref_name="main",
+        type="branch",
+        snapshot_id=3051729675574597004,
+        max_ref_age_ms=123123123,
+        max_snapshot_age_ms=12312312312,
+        min_snapshots_to_keep=1,
+    )
+
+    new_metadata = update_table_metadata(
+        table_v2_with_fixed_and_decimal_types.metadata,
+        (update,),
+    )
+
+    assert new_metadata.schemas[0].fields == (
+        NestedField(field_id=1, name="x", field_type=LongType(), required=True),
+        NestedField(field_id=4, name="a", field_type=DecimalType(precision=16, scale=2), required=True),
+        NestedField(field_id=5, name="b", field_type=DecimalType(precision=16, scale=8), required=True),
+        NestedField(field_id=6, name="c", field_type=FixedType(length=16), required=True),
+        NestedField(field_id=7, name="d", field_type=FixedType(length=18), required=True),
+    )
+
+
 def test_metadata_isolation_from_illegal_updates(table_v1: Table) -> None:
     base_metadata = table_v1.metadata
     base_metadata_backup = base_metadata.model_copy(deep=True)
@@ -782,7 +954,7 @@ def test_metadata_isolation_from_illegal_updates(table_v1: Table) -> None:
 
 def test_generate_snapshot_id(table_v2: Table) -> None:
     assert isinstance(_generate_snapshot_id(), int)
-    assert isinstance(table_v2.new_snapshot_id(), int)
+    assert isinstance(table_v2.metadata.new_snapshot_id(), int)
 
 
 def test_assert_create(table_v2: Table) -> None:
@@ -959,20 +1131,22 @@ def test_correct_schema() -> None:
     )
 
     # Should use the current schema, instead the one from the snapshot
-    assert t.scan().projection() == Schema(
-        NestedField(field_id=1, name='x', field_type=LongType(), required=True),
-        NestedField(field_id=2, name='y', field_type=LongType(), required=True),
-        NestedField(field_id=3, name='z', field_type=LongType(), required=True),
-        schema_id=1,
+    projection_schema = t.scan().projection()
+    assert projection_schema == Schema(
+        NestedField(field_id=1, name="x", field_type=LongType(), required=True),
+        NestedField(field_id=2, name="y", field_type=LongType(), required=True),
+        NestedField(field_id=3, name="z", field_type=LongType(), required=True),
         identifier_field_ids=[1, 2],
     )
+    assert projection_schema.schema_id == 1
 
     # When we explicitly filter on the commit, we want to have the schema that's linked to the snapshot
-    assert t.scan(snapshot_id=123).projection() == Schema(
-        NestedField(field_id=1, name='x', field_type=LongType(), required=True),
-        schema_id=0,
+    projection_schema = t.scan(snapshot_id=123).projection()
+    assert projection_schema == Schema(
+        NestedField(field_id=1, name="x", field_type=LongType(), required=True),
         identifier_field_ids=[],
     )
+    assert projection_schema.schema_id == 0
 
     with pytest.warns(UserWarning, match="Metadata does not contain schema with id: 10"):
         t.scan(snapshot_id=234).projection()
@@ -982,3 +1156,88 @@ def test_correct_schema() -> None:
         _ = t.scan(snapshot_id=-1).projection()
 
     assert "Snapshot not found: -1" in str(exc_info.value)
+
+
+def test_table_properties(example_table_metadata_v2: Dict[str, Any]) -> None:
+    # metadata properties are all strings
+    for k, v in example_table_metadata_v2["properties"].items():
+        assert isinstance(k, str)
+        assert isinstance(v, str)
+    metadata = TableMetadataV2(**example_table_metadata_v2)
+    for k, v in metadata.properties.items():
+        assert isinstance(k, str)
+        assert isinstance(v, str)
+
+    # property can be set to int, but still serialized as string
+    property_with_int = {"property_name": 42}
+    new_example_table_metadata_v2 = {**example_table_metadata_v2, "properties": property_with_int}
+    assert isinstance(new_example_table_metadata_v2["properties"]["property_name"], int)
+    new_metadata = TableMetadataV2(**new_example_table_metadata_v2)
+    assert isinstance(new_metadata.properties["property_name"], str)
+
+
+def test_table_properties_raise_for_none_value(example_table_metadata_v2: Dict[str, Any]) -> None:
+    property_with_none = {"property_name": None}
+    example_table_metadata_v2 = {**example_table_metadata_v2, "properties": property_with_none}
+    with pytest.raises(ValidationError) as exc_info:
+        TableMetadataV2(**example_table_metadata_v2)
+    assert "None type is not a supported value in properties: property_name" in str(exc_info.value)
+
+
+def test_serialize_commit_table_request() -> None:
+    request = CommitTableRequest(
+        requirements=(AssertTableUUID(uuid="4bfd18a3-74c6-478e-98b1-71c4c32f4163"),),
+        identifier=TableIdentifier(namespace=["a"], name="b"),
+    )
+
+    deserialized_request = CommitTableRequest.model_validate_json(request.model_dump_json())
+    assert request == deserialized_request
+
+
+def test_update_metadata_log(table_v2: Table) -> None:
+    new_snapshot = Snapshot(
+        snapshot_id=25,
+        parent_snapshot_id=19,
+        sequence_number=200,
+        timestamp_ms=1602638593590,
+        manifest_list="s3:/a/b/c.avro",
+        summary=Summary(Operation.APPEND),
+        schema_id=3,
+    )
+
+    new_metadata = update_table_metadata(
+        table_v2.metadata, (AddSnapshotUpdate(snapshot=new_snapshot),), False, table_v2.metadata_location
+    )
+    assert len(new_metadata.metadata_log) == 2
+
+
+def test_update_metadata_log_overflow(table_v2: Table) -> None:
+    metadata_log = [
+        MetadataLogEntry(
+            timestamp_ms=1602638593590 + i,
+            metadata_file=f"/path/to/metadata/{i}.json",
+        )
+        for i in range(10)
+    ]
+    table_v2.metadata = table_v2.metadata.model_copy(update={"metadata_log": metadata_log, "last_updated_ms": 1602638593600})
+    table_v2.metadata_location = "/path/to/metadata/10.json"
+    assert len(table_v2.metadata.metadata_log) == 10
+
+    base_metadata = table_v2.metadata
+    new_metadata = update_table_metadata(
+        base_metadata,
+        (SetPropertiesUpdate(updates={"write.metadata.previous-versions-max": "5"}),),
+        False,
+        table_v2.metadata_location,
+    )
+    assert len(new_metadata.metadata_log) == 5
+    assert new_metadata.metadata_log[-1].metadata_file == "/path/to/metadata/10.json"
+
+    # check invalid value of write.metadata.previous-versions-max
+    new_metadata = update_table_metadata(
+        base_metadata,
+        (SetPropertiesUpdate(updates={"write.metadata.previous-versions-max": "0"}),),
+        False,
+        table_v2.metadata_location,
+    )
+    assert len(new_metadata.metadata_log) == 1

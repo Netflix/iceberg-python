@@ -18,6 +18,7 @@
 
 import os
 import tempfile
+import uuid
 from datetime import date
 from typing import Any, List, Optional
 from unittest.mock import MagicMock, patch
@@ -28,8 +29,7 @@ import pyarrow.parquet as pq
 import pytest
 from pyarrow.fs import FileType, LocalFileSystem
 
-from pyiceberg.avro.resolver import ResolveError
-from pyiceberg.catalog.noop import NoopCatalog
+from pyiceberg.exceptions import ResolveError
 from pyiceberg.expressions import (
     AlwaysFalse,
     AlwaysTrue,
@@ -53,27 +53,32 @@ from pyiceberg.expressions import (
     GreaterThan,
     Not,
     Or,
-    literal,
 )
+from pyiceberg.expressions.literals import literal
 from pyiceberg.io import InputStream, OutputStream, load_file_io
 from pyiceberg.io.pyarrow import (
     ICEBERG_SCHEMA,
     PyArrowFile,
     PyArrowFileIO,
     StatsAggregator,
+    _check_pyarrow_schema_compatible,
     _ConvertToArrowSchema,
+    _determine_partitions,
     _primitive_to_physical,
     _read_deletes,
+    _to_requested_schema,
+    bin_pack_arrow_table,
     expression_to_pyarrow,
     project_table,
     schema_to_pyarrow,
 )
 from pyiceberg.manifest import DataFile, DataFileContent, FileFormat
-from pyiceberg.partitioning import PartitionSpec
+from pyiceberg.partitioning import PartitionField, PartitionSpec
 from pyiceberg.schema import Schema, make_compatible_name, visit
-from pyiceberg.table import FileScanTask, Table
+from pyiceberg.table import FileScanTask, TableProperties
 from pyiceberg.table.metadata import TableMetadataV2
-from pyiceberg.typedef import UTF8
+from pyiceberg.transforms import IdentityTransform
+from pyiceberg.typedef import UTF8, Properties, Record
 from pyiceberg.types import (
     BinaryType,
     BooleanType,
@@ -94,6 +99,7 @@ from pyiceberg.types import (
     TimestamptzType,
     TimeType,
 )
+from tests.conftest import UNIFIED_AWS_SESSION_PROPERTIES
 
 
 def test_pyarrow_infer_local_fs_from_path() -> None:
@@ -344,9 +350,55 @@ def test_deleting_hdfs_file_not_found() -> None:
         assert "Cannot delete file, does not exist:" in str(exc_info.value)
 
 
-def test_schema_to_pyarrow_schema(table_schema_nested: Schema) -> None:
+def test_pyarrow_s3_session_properties() -> None:
+    session_properties: Properties = {
+        "s3.endpoint": "http://localhost:9000",
+        "s3.access-key-id": "admin",
+        "s3.secret-access-key": "password",
+        "s3.region": "us-east-1",
+        "s3.session-token": "s3.session-token",
+        **UNIFIED_AWS_SESSION_PROPERTIES,
+    }
+
+    with patch("pyarrow.fs.S3FileSystem") as mock_s3fs:
+        s3_fileio = PyArrowFileIO(properties=session_properties)
+        filename = str(uuid.uuid4())
+
+        s3_fileio.new_input(location=f"s3://warehouse/{filename}")
+
+        mock_s3fs.assert_called_with(
+            endpoint_override="http://localhost:9000",
+            access_key="admin",
+            secret_key="password",
+            region="us-east-1",
+            session_token="s3.session-token",
+        )
+
+
+def test_pyarrow_unified_session_properties() -> None:
+    session_properties: Properties = {
+        "s3.endpoint": "http://localhost:9000",
+        **UNIFIED_AWS_SESSION_PROPERTIES,
+    }
+
+    with patch("pyarrow.fs.S3FileSystem") as mock_s3fs:
+        s3_fileio = PyArrowFileIO(properties=session_properties)
+        filename = str(uuid.uuid4())
+
+        s3_fileio.new_input(location=f"s3://warehouse/{filename}")
+
+        mock_s3fs.assert_called_with(
+            endpoint_override="http://localhost:9000",
+            access_key="client.access-key-id",
+            secret_key="client.secret-access-key",
+            region="client.region",
+            session_token="client.session-token",
+        )
+
+
+def test_schema_to_pyarrow_schema_include_field_ids(table_schema_nested: Schema) -> None:
     actual = schema_to_pyarrow(table_schema_nested)
-    expected = """foo: string
+    expected = """foo: large_string
   -- field metadata --
   PARQUET:field_id: '1'
 bar: int32 not null
@@ -355,20 +407,20 @@ bar: int32 not null
 baz: bool
   -- field metadata --
   PARQUET:field_id: '3'
-qux: list<element: string not null> not null
-  child 0, element: string not null
+qux: large_list<element: large_string not null> not null
+  child 0, element: large_string not null
     -- field metadata --
     PARQUET:field_id: '5'
   -- field metadata --
   PARQUET:field_id: '4'
-quux: map<string, map<string, int32>> not null
-  child 0, entries: struct<key: string not null, value: map<string, int32> not null> not null
-      child 0, key: string not null
+quux: map<large_string, map<large_string, int32>> not null
+  child 0, entries: struct<key: large_string not null, value: map<large_string, int32> not null> not null
+      child 0, key: large_string not null
       -- field metadata --
       PARQUET:field_id: '7'
-      child 1, value: map<string, int32> not null
-          child 0, entries: struct<key: string not null, value: int32 not null> not null
-              child 0, key: string not null
+      child 1, value: map<large_string, int32> not null
+          child 0, entries: struct<key: large_string not null, value: int32 not null> not null
+              child 0, key: large_string not null
           -- field metadata --
           PARQUET:field_id: '9'
               child 1, value: int32 not null
@@ -378,7 +430,7 @@ quux: map<string, map<string, int32>> not null
       PARQUET:field_id: '8'
   -- field metadata --
   PARQUET:field_id: '6'
-location: list<element: struct<latitude: float, longitude: float> not null> not null
+location: large_list<element: struct<latitude: float, longitude: float> not null> not null
   child 0, element: struct<latitude: float, longitude: float> not null
       child 0, latitude: float
       -- field metadata --
@@ -390,8 +442,8 @@ location: list<element: struct<latitude: float, longitude: float> not null> not 
     PARQUET:field_id: '12'
   -- field metadata --
   PARQUET:field_id: '11'
-person: struct<name: string, age: int32 not null>
-  child 0, name: string
+person: struct<name: large_string, age: int32 not null>
+  child 0, name: large_string
     -- field metadata --
     PARQUET:field_id: '16'
   child 1, age: int32 not null
@@ -399,6 +451,30 @@ person: struct<name: string, age: int32 not null>
     PARQUET:field_id: '17'
   -- field metadata --
   PARQUET:field_id: '15'"""
+    assert repr(actual) == expected
+
+
+def test_schema_to_pyarrow_schema_exclude_field_ids(table_schema_nested: Schema) -> None:
+    actual = schema_to_pyarrow(table_schema_nested, include_field_ids=False)
+    expected = """foo: large_string
+bar: int32 not null
+baz: bool
+qux: large_list<element: large_string not null> not null
+  child 0, element: large_string not null
+quux: map<large_string, map<large_string, int32>> not null
+  child 0, entries: struct<key: large_string not null, value: map<large_string, int32> not null> not null
+      child 0, key: large_string not null
+      child 1, value: map<large_string, int32> not null
+          child 0, entries: struct<key: large_string not null, value: int32 not null> not null
+              child 0, key: large_string not null
+              child 1, value: int32 not null
+location: large_list<element: struct<latitude: float, longitude: float> not null> not null
+  child 0, element: struct<latitude: float, longitude: float> not null
+      child 0, latitude: float
+      child 1, longitude: float
+person: struct<name: large_string, age: int32 not null>
+  child 0, name: large_string
+  child 1, age: int32 not null"""
     assert repr(actual) == expected
 
 
@@ -462,7 +538,7 @@ def test_timestamptz_type_to_pyarrow() -> None:
 
 def test_string_type_to_pyarrow() -> None:
     iceberg_type = StringType()
-    assert visit(iceberg_type, _ConvertToArrowSchema()) == pa.string()
+    assert visit(iceberg_type, _ConvertToArrowSchema()) == pa.large_string()
 
 
 def test_binary_type_to_pyarrow() -> None:
@@ -472,7 +548,7 @@ def test_binary_type_to_pyarrow() -> None:
 
 def test_struct_type_to_pyarrow(table_schema_simple: Schema) -> None:
     expected = pa.struct([
-        pa.field("foo", pa.string(), nullable=True, metadata={"field_id": "1"}),
+        pa.field("foo", pa.large_string(), nullable=True, metadata={"field_id": "1"}),
         pa.field("bar", pa.int32(), nullable=False, metadata={"field_id": "2"}),
         pa.field("baz", pa.bool_(), nullable=True, metadata={"field_id": "3"}),
     ])
@@ -489,7 +565,7 @@ def test_map_type_to_pyarrow() -> None:
     )
     assert visit(iceberg_map, _ConvertToArrowSchema()) == pa.map_(
         pa.field("key", pa.int32(), nullable=False, metadata={"field_id": "1"}),
-        pa.field("value", pa.string(), nullable=False, metadata={"field_id": "2"}),
+        pa.field("value", pa.large_string(), nullable=False, metadata={"field_id": "2"}),
     )
 
 
@@ -499,7 +575,7 @@ def test_list_type_to_pyarrow() -> None:
         element_type=IntegerType(),
         element_required=True,
     )
-    assert visit(iceberg_map, _ConvertToArrowSchema()) == pa.list_(
+    assert visit(iceberg_map, _ConvertToArrowSchema()) == pa.large_list(
         pa.field("element", pa.int32(), nullable=False, metadata={"field_id": "1"})
     )
 
@@ -582,11 +658,11 @@ def test_expr_less_than_or_equal_to_pyarrow(bound_reference: BoundReference[str]
 
 def test_expr_in_to_pyarrow(bound_reference: BoundReference[str]) -> None:
     assert repr(expression_to_pyarrow(BoundIn(bound_reference, {literal("hello"), literal("world")}))) in (
-        """<pyarrow.compute.Expression is_in(foo, {value_set=string:[
+        """<pyarrow.compute.Expression is_in(foo, {value_set=large_string:[
   "hello",
   "world"
 ], null_matching_behavior=MATCH})>""",
-        """<pyarrow.compute.Expression is_in(foo, {value_set=string:[
+        """<pyarrow.compute.Expression is_in(foo, {value_set=large_string:[
   "world",
   "hello"
 ], null_matching_behavior=MATCH})>""",
@@ -595,11 +671,11 @@ def test_expr_in_to_pyarrow(bound_reference: BoundReference[str]) -> None:
 
 def test_expr_not_in_to_pyarrow(bound_reference: BoundReference[str]) -> None:
     assert repr(expression_to_pyarrow(BoundNotIn(bound_reference, {literal("hello"), literal("world")}))) in (
-        """<pyarrow.compute.Expression invert(is_in(foo, {value_set=string:[
+        """<pyarrow.compute.Expression invert(is_in(foo, {value_set=large_string:[
   "hello",
   "world"
 ], null_matching_behavior=MATCH}))>""",
-        """<pyarrow.compute.Expression invert(is_in(foo, {value_set=string:[
+        """<pyarrow.compute.Expression invert(is_in(foo, {value_set=large_string:[
   "world",
   "hello"
 ], null_matching_behavior=MATCH}))>""",
@@ -716,7 +792,9 @@ def schema_map_of_structs() -> Schema:
                 key_id=51,
                 value_id=52,
                 key_type=StringType(),
-                value_type=StructType(NestedField(511, "lat", DoubleType()), NestedField(512, "long", DoubleType())),
+                value_type=StructType(
+                    NestedField(511, "lat", DoubleType(), required=True), NestedField(512, "long", DoubleType(), required=True)
+                ),
                 element_required=False,
             ),
             required=False,
@@ -875,7 +953,7 @@ def project(
     schema: Schema, files: List[str], expr: Optional[BooleanExpression] = None, table_schema: Optional[Schema] = None
 ) -> pa.Table:
     return project_table(
-        [
+        tasks=[
             FileScanTask(
                 DataFile(
                     content=DataFileContent.DATA,
@@ -888,21 +966,16 @@ def project(
             )
             for file in files
         ],
-        Table(
-            ("namespace", "table"),
-            metadata=TableMetadataV2(
-                location="file://a/b/",
-                last_column_id=1,
-                format_version=2,
-                schemas=[table_schema or schema],
-                partition_specs=[PartitionSpec()],
-            ),
-            metadata_location="file://a/b/c.json",
-            io=PyArrowFileIO(),
-            catalog=NoopCatalog("NoopCatalog"),
+        table_metadata=TableMetadataV2(
+            location="file://a/b/",
+            last_column_id=1,
+            format_version=2,
+            schemas=[table_schema or schema],
+            partition_specs=[PartitionSpec()],
         ),
-        expr or AlwaysTrue(),
-        schema,
+        io=PyArrowFileIO(),
+        row_filter=expr or AlwaysTrue(),
+        projected_schema=schema,
         case_sensitive=True,
     )
 
@@ -946,25 +1019,15 @@ def test_projection_add_column(file_int: str) -> None:
     assert (
         repr(result_table.schema)
         == """id: int32
-list: list<element: int32>
+list: large_list<element: int32>
   child 0, element: int32
-    -- field metadata --
-    PARQUET:field_id: '21'
-map: map<int32, string>
-  child 0, entries: struct<key: int32 not null, value: string> not null
+map: map<int32, large_string>
+  child 0, entries: struct<key: int32 not null, value: large_string> not null
       child 0, key: int32 not null
-      -- field metadata --
-      PARQUET:field_id: '31'
-      child 1, value: string
-      -- field metadata --
-      PARQUET:field_id: '32'
+      child 1, value: large_string
 location: struct<lat: double, lon: double>
   child 0, lat: double
-    -- field metadata --
-    PARQUET:field_id: '41'
-  child 1, lon: double
-    -- field metadata --
-    PARQUET:field_id: '42'"""
+  child 1, lon: double"""
     )
 
 
@@ -977,7 +1040,7 @@ def test_read_list(schema_list: Schema, file_list: str) -> None:
 
     assert (
         repr(result_table.schema)
-        == """ids: list<element: int32>
+        == """ids: large_list<element: int32>
   child 0, element: int32"""
     )
 
@@ -991,10 +1054,10 @@ def test_read_map(schema_map: Schema, file_map: str) -> None:
 
     assert (
         repr(result_table.schema)
-        == """properties: map<string, string>
-  child 0, entries: struct<key: string not null, value: string not null> not null
-      child 0, key: string not null
-      child 1, value: string not null"""
+        == """properties: map<large_string, large_string>
+  child 0, entries: struct<key: large_string not null, value: large_string not null> not null
+      child 0, key: large_string not null
+      child 1, value: large_string not null"""
     )
 
 
@@ -1014,14 +1077,10 @@ def test_projection_add_column_struct(schema_int: Schema, file_int: str) -> None
         assert r.as_py() is None
     assert (
         repr(result_table.schema)
-        == """id: map<int32, string>
-  child 0, entries: struct<key: int32 not null, value: string> not null
+        == """id: map<int32, large_string>
+  child 0, entries: struct<key: int32 not null, value: large_string> not null
       child 0, key: int32 not null
-      -- field metadata --
-      PARQUET:field_id: '3'
-      child 1, value: string
-      -- field metadata --
-      PARQUET:field_id: '4'"""
+      child 1, value: large_string"""
     )
 
 
@@ -1043,7 +1102,7 @@ def test_projection_add_column_struct_required(file_int: str) -> None:
 def test_projection_rename_column(schema_int: Schema, file_int: str) -> None:
     schema = Schema(
         # Reuses the id 1
-        NestedField(1, "other_name", IntegerType())
+        NestedField(1, "other_name", IntegerType(), required=True)
     )
     result_table = project(schema, [file_int])
     assert len(result_table.columns[0]) == 3
@@ -1065,18 +1124,13 @@ def test_projection_concat_files(schema_int: Schema, file_int: str) -> None:
 def test_projection_filter(schema_int: Schema, file_int: str) -> None:
     result_table = project(schema_int, [file_int], GreaterThan("id", 4))
     assert len(result_table.columns[0]) == 0
-    assert (
-        repr(result_table.schema)
-        == """id: int32
-  -- field metadata --
-  PARQUET:field_id: '1'"""
-    )
+    assert repr(result_table.schema) == """id: int32"""
 
 
 def test_projection_filter_renamed_column(file_int: str) -> None:
     schema = Schema(
         # Reuses the id 1
-        NestedField(1, "other_id", IntegerType())
+        NestedField(1, "other_id", IntegerType(), required=True)
     )
     result_table = project(schema, [file_int], GreaterThan("other_id", 1))
     assert len(result_table.columns[0]) == 1
@@ -1094,7 +1148,7 @@ def test_projection_filter_add_column(schema_int: Schema, file_int: str, file_st
 
 
 def test_projection_filter_add_column_promote(file_int: str) -> None:
-    schema_long = Schema(NestedField(1, "id", LongType()))
+    schema_long = Schema(NestedField(1, "id", LongType(), required=True))
     result_table = project(schema_long, [file_int])
 
     for actual, expected in zip(result_table.columns[0], [0, 1, 2]):
@@ -1116,9 +1170,10 @@ def test_projection_nested_struct_subset(file_struct: str) -> None:
             4,
             "location",
             StructType(
-                NestedField(41, "lat", DoubleType()),
+                NestedField(41, "lat", DoubleType(), required=True),
                 # long is missing!
             ),
+            required=True,
         )
     )
 
@@ -1143,6 +1198,7 @@ def test_projection_nested_new_field(file_struct: str) -> None:
             StructType(
                 NestedField(43, "null", DoubleType(), required=False),  # Whoa, this column doesn't exist in the file
             ),
+            required=True,
         )
     )
 
@@ -1168,6 +1224,7 @@ def test_projection_nested_struct(schema_struct: Schema, file_struct: str) -> No
                 NestedField(43, "null", DoubleType(), required=False),
                 NestedField(42, "long", DoubleType(), required=False),
             ),
+            required=True,
         )
     )
 
@@ -1199,8 +1256,8 @@ def test_projection_list_of_structs(schema_list_of_structs: Schema, file_list_of
             ListType(
                 51,
                 StructType(
-                    NestedField(511, "latitude", DoubleType()),
-                    NestedField(512, "longitude", DoubleType()),
+                    NestedField(511, "latitude", DoubleType(), required=True),
+                    NestedField(512, "longitude", DoubleType(), required=True),
                     NestedField(513, "altitude", DoubleType(), required=False),
                 ),
                 element_required=False,
@@ -1215,18 +1272,18 @@ def test_projection_list_of_structs(schema_list_of_structs: Schema, file_list_of
     results = [row.as_py() for row in result_table.columns[0]]
     assert results == [
         [
-            {'latitude': 52.371807, 'longitude': 4.896029, 'altitude': None},
-            {'latitude': 52.387386, 'longitude': 4.646219, 'altitude': None},
+            {"latitude": 52.371807, "longitude": 4.896029, "altitude": None},
+            {"latitude": 52.387386, "longitude": 4.646219, "altitude": None},
         ],
         [],
         [
-            {'latitude': 52.078663, 'longitude': 4.288788, 'altitude': None},
-            {'latitude': 52.387386, 'longitude': 4.646219, 'altitude': None},
+            {"latitude": 52.078663, "longitude": 4.288788, "altitude": None},
+            {"latitude": 52.387386, "longitude": 4.646219, "altitude": None},
         ],
     ]
     assert (
         repr(result_table.schema)
-        == """locations: list<element: struct<latitude: double not null, longitude: double not null, altitude: double>>
+        == """locations: large_list<element: struct<latitude: double not null, longitude: double not null, altitude: double>>
   child 0, element: struct<latitude: double not null, longitude: double not null, altitude: double>
       child 0, latitude: double not null
       child 1, longitude: double not null
@@ -1244,9 +1301,9 @@ def test_projection_maps_of_structs(schema_map_of_structs: Schema, file_map_of_s
                 value_id=52,
                 key_type=StringType(),
                 value_type=StructType(
-                    NestedField(511, "latitude", DoubleType()),
-                    NestedField(512, "longitude", DoubleType()),
-                    NestedField(513, "altitude", DoubleType(), required=False),
+                    NestedField(511, "latitude", DoubleType(), required=True),
+                    NestedField(512, "longitude", DoubleType(), required=True),
+                    NestedField(513, "altitude", DoubleType()),
                 ),
                 element_required=False,
             ),
@@ -1274,9 +1331,9 @@ def test_projection_maps_of_structs(schema_map_of_structs: Schema, file_map_of_s
         assert actual.as_py() == expected
     assert (
         repr(result_table.schema)
-        == """locations: map<string, struct<latitude: double not null, longitude: double not null, altitude: double>>
-  child 0, entries: struct<key: string not null, value: struct<latitude: double not null, longitude: double not null, altitude: double> not null> not null
-      child 0, key: string not null
+        == """locations: map<large_string, struct<latitude: double not null, longitude: double not null, altitude: double>>
+  child 0, entries: struct<key: large_string not null, value: struct<latitude: double not null, longitude: double not null, altitude: double> not null> not null
+      child 0, key: large_string not null
       child 1, value: struct<latitude: double not null, longitude: double not null, altitude: double> not null
           child 0, latitude: double not null
           child 1, longitude: double not null
@@ -1304,16 +1361,12 @@ def test_projection_nested_struct_different_parent_id(file_struct: str) -> None:
         repr(result_table.schema)
         == """location: struct<lat: double, long: double>
   child 0, lat: double
-    -- field metadata --
-    PARQUET:field_id: '41'
-  child 1, long: double
-    -- field metadata --
-    PARQUET:field_id: '42'"""
+  child 1, long: double"""
     )
 
 
 def test_projection_filter_on_unprojected_field(schema_int_str: Schema, file_int_str: str) -> None:
-    schema = Schema(NestedField(1, "id", IntegerType()))
+    schema = Schema(NestedField(1, "id", IntegerType(), required=True))
 
     result_table = project(schema, [file_int_str], GreaterThan("data", "1"), schema_int_str)
 
@@ -1361,20 +1414,15 @@ def test_delete(deletes_file: str, example_task: FileScanTask, table_schema_simp
 
     with_deletes = project_table(
         tasks=[example_task_with_delete],
-        table=Table(
-            ("namespace", "table"),
-            metadata=TableMetadataV2(
-                location=metadata_location,
-                last_column_id=1,
-                format_version=2,
-                current_schema_id=1,
-                schemas=[table_schema_simple],
-                partition_specs=[PartitionSpec()],
-            ),
-            metadata_location=metadata_location,
-            io=load_file_io(),
-            catalog=NoopCatalog("noop"),
+        table_metadata=TableMetadataV2(
+            location=metadata_location,
+            last_column_id=1,
+            format_version=2,
+            current_schema_id=1,
+            schemas=[table_schema_simple],
+            partition_specs=[PartitionSpec()],
         ),
+        io=load_file_io(),
         row_filter=AlwaysTrue(),
         projected_schema=table_schema_simple,
     )
@@ -1382,8 +1430,8 @@ def test_delete(deletes_file: str, example_task: FileScanTask, table_schema_simp
     assert (
         str(with_deletes)
         == """pyarrow.Table
-foo: string
-bar: int64 not null
+foo: large_string
+bar: int32 not null
 baz: bool
 ----
 foo: [["a","c"]]
@@ -1404,20 +1452,15 @@ def test_delete_duplicates(deletes_file: str, example_task: FileScanTask, table_
 
     with_deletes = project_table(
         tasks=[example_task_with_delete],
-        table=Table(
-            ("namespace", "table"),
-            metadata=TableMetadataV2(
-                location=metadata_location,
-                last_column_id=1,
-                format_version=2,
-                current_schema_id=1,
-                schemas=[table_schema_simple],
-                partition_specs=[PartitionSpec()],
-            ),
-            metadata_location=metadata_location,
-            io=load_file_io(),
-            catalog=NoopCatalog("noop"),
+        table_metadata=TableMetadataV2(
+            location=metadata_location,
+            last_column_id=1,
+            format_version=2,
+            current_schema_id=1,
+            schemas=[table_schema_simple],
+            partition_specs=[PartitionSpec()],
         ),
+        io=load_file_io(),
         row_filter=AlwaysTrue(),
         projected_schema=table_schema_simple,
     )
@@ -1425,8 +1468,8 @@ def test_delete_duplicates(deletes_file: str, example_task: FileScanTask, table_
     assert (
         str(with_deletes)
         == """pyarrow.Table
-foo: string
-bar: int64 not null
+foo: large_string
+bar: int32 not null
 baz: bool
 ----
 foo: [["a","c"]]
@@ -1438,21 +1481,16 @@ baz: [[true,null]]"""
 def test_pyarrow_wrap_fsspec(example_task: FileScanTask, table_schema_simple: Schema) -> None:
     metadata_location = "file://a/b/c.json"
     projection = project_table(
-        [example_task],
-        Table(
-            ("namespace", "table"),
-            metadata=TableMetadataV2(
-                location=metadata_location,
-                last_column_id=1,
-                format_version=2,
-                current_schema_id=1,
-                schemas=[table_schema_simple],
-                partition_specs=[PartitionSpec()],
-            ),
-            metadata_location=metadata_location,
-            io=load_file_io(properties={"py-io-impl": "pyiceberg.io.fsspec.FsspecFileIO"}, location=metadata_location),
-            catalog=NoopCatalog("NoopCatalog"),
+        tasks=[example_task],
+        table_metadata=TableMetadataV2(
+            location=metadata_location,
+            last_column_id=1,
+            format_version=2,
+            current_schema_id=1,
+            schemas=[table_schema_simple],
+            partition_specs=[PartitionSpec()],
         ),
+        io=load_file_io(properties={"py-io-impl": "pyiceberg.io.fsspec.FsspecFileIO"}, location=metadata_location),
         case_sensitive=True,
         projected_schema=table_schema_simple,
         row_filter=AlwaysTrue(),
@@ -1461,8 +1499,8 @@ def test_pyarrow_wrap_fsspec(example_task: FileScanTask, table_schema_simple: Sc
     assert (
         str(projection)
         == """pyarrow.Table
-foo: string
-bar: int64 not null
+foo: large_string
+bar: int32 not null
 baz: bool
 ----
 foo: [["a","b","c"]]
@@ -1659,9 +1697,9 @@ def test_parse_location() -> None:
         assert netloc == expected_netloc
         assert uri == expected_uri
 
-    check_results("hdfs://127.0.0.1:9000/root/foo.txt", "hdfs", "127.0.0.1:9000", "hdfs://127.0.0.1:9000/root/foo.txt")
-    check_results("hdfs://127.0.0.1/root/foo.txt", "hdfs", "127.0.0.1", "hdfs://127.0.0.1/root/foo.txt")
-    check_results("hdfs://clusterA/root/foo.txt", "hdfs", "clusterA", "hdfs://clusterA/root/foo.txt")
+    check_results("hdfs://127.0.0.1:9000/root/foo.txt", "hdfs", "127.0.0.1:9000", "/root/foo.txt")
+    check_results("hdfs://127.0.0.1/root/foo.txt", "hdfs", "127.0.0.1", "/root/foo.txt")
+    check_results("hdfs://clusterA/root/foo.txt", "hdfs", "clusterA", "/root/foo.txt")
 
     check_results("/root/foo.txt", "file", "", "/root/foo.txt")
     check_results("/root/tmp/foo.txt", "file", "", "/root/tmp/foo.txt")
@@ -1710,3 +1748,331 @@ def test_stats_aggregator_update_max(vals: List[Any], primitive_type: PrimitiveT
         stats.update_max(val)
 
     assert stats.current_max == expected_result
+
+
+def test_bin_pack_arrow_table(arrow_table_with_null: pa.Table) -> None:
+    # default packs to 1 bin since the table is small
+    bin_packed = bin_pack_arrow_table(
+        arrow_table_with_null, target_file_size=TableProperties.WRITE_TARGET_FILE_SIZE_BYTES_DEFAULT
+    )
+    assert len(list(bin_packed)) == 1
+
+    # as long as table is smaller than default target size, it should pack to 1 bin
+    bigger_arrow_tbl = pa.concat_tables([arrow_table_with_null] * 10)
+    assert bigger_arrow_tbl.nbytes < TableProperties.WRITE_TARGET_FILE_SIZE_BYTES_DEFAULT
+    bin_packed = bin_pack_arrow_table(bigger_arrow_tbl, target_file_size=TableProperties.WRITE_TARGET_FILE_SIZE_BYTES_DEFAULT)
+    assert len(list(bin_packed)) == 1
+
+    # unless we override the target size to be smaller
+    bin_packed = bin_pack_arrow_table(bigger_arrow_tbl, target_file_size=arrow_table_with_null.nbytes)
+    assert len(list(bin_packed)) == 10
+
+    # and will produce half the number of files if we double the target size
+    bin_packed = bin_pack_arrow_table(bigger_arrow_tbl, target_file_size=arrow_table_with_null.nbytes * 2)
+    assert len(list(bin_packed)) == 5
+
+
+def test_schema_mismatch_type(table_schema_simple: Schema) -> None:
+    other_schema = pa.schema((
+        pa.field("foo", pa.string(), nullable=True),
+        pa.field("bar", pa.decimal128(18, 6), nullable=False),
+        pa.field("baz", pa.bool_(), nullable=True),
+    ))
+
+    expected = r"""Mismatch in fields:
+┏━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃    ┃ Table field              ┃ Dataframe field                 ┃
+┡━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+│ ✅ │ 1: foo: optional string  │ 1: foo: optional string         │
+│ ❌ │ 2: bar: required int     │ 2: bar: required decimal\(18, 6\) │
+│ ✅ │ 3: baz: optional boolean │ 3: baz: optional boolean        │
+└────┴──────────────────────────┴─────────────────────────────────┘
+"""
+
+    with pytest.raises(ValueError, match=expected):
+        _check_pyarrow_schema_compatible(table_schema_simple, other_schema)
+
+
+def test_schema_mismatch_nullability(table_schema_simple: Schema) -> None:
+    other_schema = pa.schema((
+        pa.field("foo", pa.string(), nullable=True),
+        pa.field("bar", pa.int32(), nullable=True),
+        pa.field("baz", pa.bool_(), nullable=True),
+    ))
+
+    expected = """Mismatch in fields:
+┏━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃    ┃ Table field              ┃ Dataframe field          ┃
+┡━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+│ ✅ │ 1: foo: optional string  │ 1: foo: optional string  │
+│ ❌ │ 2: bar: required int     │ 2: bar: optional int     │
+│ ✅ │ 3: baz: optional boolean │ 3: baz: optional boolean │
+└────┴──────────────────────────┴──────────────────────────┘
+"""
+
+    with pytest.raises(ValueError, match=expected):
+        _check_pyarrow_schema_compatible(table_schema_simple, other_schema)
+
+
+def test_schema_compatible_nullability_diff(table_schema_simple: Schema) -> None:
+    other_schema = pa.schema((
+        pa.field("foo", pa.string(), nullable=True),
+        pa.field("bar", pa.int32(), nullable=False),
+        pa.field("baz", pa.bool_(), nullable=False),
+    ))
+
+    try:
+        _check_pyarrow_schema_compatible(table_schema_simple, other_schema)
+    except Exception:
+        pytest.fail("Unexpected Exception raised when calling `_check_pyarrow_schema_compatible`")
+
+
+def test_schema_mismatch_missing_field(table_schema_simple: Schema) -> None:
+    other_schema = pa.schema((
+        pa.field("foo", pa.string(), nullable=True),
+        pa.field("baz", pa.bool_(), nullable=True),
+    ))
+
+    expected = """Mismatch in fields:
+┏━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃    ┃ Table field              ┃ Dataframe field          ┃
+┡━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+│ ✅ │ 1: foo: optional string  │ 1: foo: optional string  │
+│ ❌ │ 2: bar: required int     │ Missing                  │
+│ ✅ │ 3: baz: optional boolean │ 3: baz: optional boolean │
+└────┴──────────────────────────┴──────────────────────────┘
+"""
+
+    with pytest.raises(ValueError, match=expected):
+        _check_pyarrow_schema_compatible(table_schema_simple, other_schema)
+
+
+def test_schema_compatible_missing_nullable_field_nested(table_schema_nested: Schema) -> None:
+    schema = table_schema_nested.as_arrow()
+    schema = schema.remove(6).insert(
+        6,
+        pa.field(
+            "person",
+            pa.struct([
+                pa.field("age", pa.int32(), nullable=False),
+            ]),
+            nullable=True,
+        ),
+    )
+    try:
+        _check_pyarrow_schema_compatible(table_schema_nested, schema)
+    except Exception:
+        pytest.fail("Unexpected Exception raised when calling `_check_pyarrow_schema_compatible`")
+
+
+def test_schema_mismatch_missing_required_field_nested(table_schema_nested: Schema) -> None:
+    other_schema = table_schema_nested.as_arrow()
+    other_schema = other_schema.remove(6).insert(
+        6,
+        pa.field(
+            "person",
+            pa.struct([
+                pa.field("name", pa.string(), nullable=True),
+            ]),
+            nullable=True,
+        ),
+    )
+    expected = """Mismatch in fields:
+┏━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃    ┃ Table field                        ┃ Dataframe field                    ┃
+┡━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+│ ✅ │ 1: foo: optional string            │ 1: foo: optional string            │
+│ ✅ │ 2: bar: required int               │ 2: bar: required int               │
+│ ✅ │ 3: baz: optional boolean           │ 3: baz: optional boolean           │
+│ ✅ │ 4: qux: required list<string>      │ 4: qux: required list<string>      │
+│ ✅ │ 5: element: required string        │ 5: element: required string        │
+│ ✅ │ 6: quux: required map<string,      │ 6: quux: required map<string,      │
+│    │ map<string, int>>                  │ map<string, int>>                  │
+│ ✅ │ 7: key: required string            │ 7: key: required string            │
+│ ✅ │ 8: value: required map<string,     │ 8: value: required map<string,     │
+│    │ int>                               │ int>                               │
+│ ✅ │ 9: key: required string            │ 9: key: required string            │
+│ ✅ │ 10: value: required int            │ 10: value: required int            │
+│ ✅ │ 11: location: required             │ 11: location: required             │
+│    │ list<struct<13: latitude: optional │ list<struct<13: latitude: optional │
+│    │ float, 14: longitude: optional     │ float, 14: longitude: optional     │
+│    │ float>>                            │ float>>                            │
+│ ✅ │ 12: element: required struct<13:   │ 12: element: required struct<13:   │
+│    │ latitude: optional float, 14:      │ latitude: optional float, 14:      │
+│    │ longitude: optional float>         │ longitude: optional float>         │
+│ ✅ │ 13: latitude: optional float       │ 13: latitude: optional float       │
+│ ✅ │ 14: longitude: optional float      │ 14: longitude: optional float      │
+│ ✅ │ 15: person: optional struct<16:    │ 15: person: optional struct<16:    │
+│    │ name: optional string, 17: age:    │ name: optional string>             │
+│    │ required int>                      │                                    │
+│ ✅ │ 16: name: optional string          │ 16: name: optional string          │
+│ ❌ │ 17: age: required int              │ Missing                            │
+└────┴────────────────────────────────────┴────────────────────────────────────┘
+"""
+
+    with pytest.raises(ValueError, match=expected):
+        _check_pyarrow_schema_compatible(table_schema_nested, other_schema)
+
+
+def test_schema_compatible_nested(table_schema_nested: Schema) -> None:
+    try:
+        _check_pyarrow_schema_compatible(table_schema_nested, table_schema_nested.as_arrow())
+    except Exception:
+        pytest.fail("Unexpected Exception raised when calling `_check_pyarrow_schema_compatible`")
+
+
+def test_schema_mismatch_additional_field(table_schema_simple: Schema) -> None:
+    other_schema = pa.schema((
+        pa.field("foo", pa.string(), nullable=True),
+        pa.field("bar", pa.int32(), nullable=False),
+        pa.field("baz", pa.bool_(), nullable=True),
+        pa.field("new_field", pa.date32(), nullable=True),
+    ))
+
+    with pytest.raises(
+        ValueError, match=r"PyArrow table contains more columns: new_field. Update the schema first \(hint, use union_by_name\)."
+    ):
+        _check_pyarrow_schema_compatible(table_schema_simple, other_schema)
+
+
+def test_schema_compatible(table_schema_simple: Schema) -> None:
+    try:
+        _check_pyarrow_schema_compatible(table_schema_simple, table_schema_simple.as_arrow())
+    except Exception:
+        pytest.fail("Unexpected Exception raised when calling `_check_pyarrow_schema_compatible`")
+
+
+def test_schema_projection(table_schema_simple: Schema) -> None:
+    # remove optional `baz` field from `table_schema_simple`
+    other_schema = pa.schema((
+        pa.field("foo", pa.string(), nullable=True),
+        pa.field("bar", pa.int32(), nullable=False),
+    ))
+    try:
+        _check_pyarrow_schema_compatible(table_schema_simple, other_schema)
+    except Exception:
+        pytest.fail("Unexpected Exception raised when calling `_check_pyarrow_schema_compatible`")
+
+
+def test_schema_downcast(table_schema_simple: Schema) -> None:
+    # large_string type is compatible with string type
+    other_schema = pa.schema((
+        pa.field("foo", pa.large_string(), nullable=True),
+        pa.field("bar", pa.int32(), nullable=False),
+        pa.field("baz", pa.bool_(), nullable=True),
+    ))
+
+    try:
+        _check_pyarrow_schema_compatible(table_schema_simple, other_schema)
+    except Exception:
+        pytest.fail("Unexpected Exception raised when calling `_check_pyarrow_schema_compatible`")
+
+
+def test_partition_for_demo() -> None:
+    test_pa_schema = pa.schema([("year", pa.int64()), ("n_legs", pa.int64()), ("animal", pa.string())])
+    test_schema = Schema(
+        NestedField(field_id=1, name="year", field_type=StringType(), required=False),
+        NestedField(field_id=2, name="n_legs", field_type=IntegerType(), required=True),
+        NestedField(field_id=3, name="animal", field_type=StringType(), required=False),
+        schema_id=1,
+    )
+    test_data = {
+        "year": [2020, 2022, 2022, 2022, 2021, 2022, 2022, 2019, 2021],
+        "n_legs": [2, 2, 2, 4, 4, 4, 4, 5, 100],
+        "animal": ["Flamingo", "Parrot", "Parrot", "Horse", "Dog", "Horse", "Horse", "Brittle stars", "Centipede"],
+    }
+    arrow_table = pa.Table.from_pydict(test_data, schema=test_pa_schema)
+    partition_spec = PartitionSpec(
+        PartitionField(source_id=2, field_id=1002, transform=IdentityTransform(), name="n_legs_identity"),
+        PartitionField(source_id=1, field_id=1001, transform=IdentityTransform(), name="year_identity"),
+    )
+    result = _determine_partitions(partition_spec, test_schema, arrow_table)
+    assert {table_partition.partition_key.partition for table_partition in result} == {
+        Record(n_legs_identity=2, year_identity=2020),
+        Record(n_legs_identity=100, year_identity=2021),
+        Record(n_legs_identity=4, year_identity=2021),
+        Record(n_legs_identity=4, year_identity=2022),
+        Record(n_legs_identity=2, year_identity=2022),
+        Record(n_legs_identity=5, year_identity=2019),
+    }
+    assert (
+        pa.concat_tables([table_partition.arrow_table_partition for table_partition in result]).num_rows == arrow_table.num_rows
+    )
+
+
+def test_identity_partition_on_multi_columns() -> None:
+    test_pa_schema = pa.schema([("born_year", pa.int64()), ("n_legs", pa.int64()), ("animal", pa.string())])
+    test_schema = Schema(
+        NestedField(field_id=1, name="born_year", field_type=StringType(), required=False),
+        NestedField(field_id=2, name="n_legs", field_type=IntegerType(), required=True),
+        NestedField(field_id=3, name="animal", field_type=StringType(), required=False),
+        schema_id=1,
+    )
+    # 5 partitions, 6 unique row values, 12 rows
+    test_rows = [
+        (2021, 4, "Dog"),
+        (2022, 4, "Horse"),
+        (2022, 4, "Another Horse"),
+        (2021, 100, "Centipede"),
+        (None, 4, "Kirin"),
+        (2021, None, "Fish"),
+    ] * 2
+    expected = {Record(n_legs_identity=test_rows[i][1], year_identity=test_rows[i][0]) for i in range(len(test_rows))}
+    partition_spec = PartitionSpec(
+        PartitionField(source_id=2, field_id=1002, transform=IdentityTransform(), name="n_legs_identity"),
+        PartitionField(source_id=1, field_id=1001, transform=IdentityTransform(), name="year_identity"),
+    )
+    import random
+
+    # there are 12! / ((2!)^6) = 7,484,400 permutations, too many to pick all
+    for _ in range(1000):
+        random.shuffle(test_rows)
+        test_data = {
+            "born_year": [row[0] for row in test_rows],
+            "n_legs": [row[1] for row in test_rows],
+            "animal": [row[2] for row in test_rows],
+        }
+        arrow_table = pa.Table.from_pydict(test_data, schema=test_pa_schema)
+
+        result = _determine_partitions(partition_spec, test_schema, arrow_table)
+
+        assert {table_partition.partition_key.partition for table_partition in result} == expected
+        concatenated_arrow_table = pa.concat_tables([table_partition.arrow_table_partition for table_partition in result])
+        assert concatenated_arrow_table.num_rows == arrow_table.num_rows
+        assert concatenated_arrow_table.sort_by([
+            ("born_year", "ascending"),
+            ("n_legs", "ascending"),
+            ("animal", "ascending"),
+        ]) == arrow_table.sort_by([("born_year", "ascending"), ("n_legs", "ascending"), ("animal", "ascending")])
+
+
+def test__to_requested_schema_timestamps(
+    arrow_table_schema_with_all_timestamp_precisions: pa.Schema,
+    arrow_table_with_all_timestamp_precisions: pa.Table,
+    arrow_table_schema_with_all_microseconds_timestamp_precisions: pa.Schema,
+    table_schema_with_all_microseconds_timestamp_precision: Schema,
+) -> None:
+    requested_schema = table_schema_with_all_microseconds_timestamp_precision
+    file_schema = requested_schema
+    batch = arrow_table_with_all_timestamp_precisions.to_batches()[0]
+    result = _to_requested_schema(requested_schema, file_schema, batch, downcast_ns_timestamp_to_us=True, include_field_ids=False)
+
+    expected = arrow_table_with_all_timestamp_precisions.cast(
+        arrow_table_schema_with_all_microseconds_timestamp_precisions, safe=False
+    ).to_batches()[0]
+    assert result == expected
+
+
+def test__to_requested_schema_timestamps_without_downcast_raises_exception(
+    arrow_table_schema_with_all_timestamp_precisions: pa.Schema,
+    arrow_table_with_all_timestamp_precisions: pa.Table,
+    arrow_table_schema_with_all_microseconds_timestamp_precisions: pa.Schema,
+    table_schema_with_all_microseconds_timestamp_precision: Schema,
+) -> None:
+    requested_schema = table_schema_with_all_microseconds_timestamp_precision
+    file_schema = requested_schema
+    batch = arrow_table_with_all_timestamp_precisions.to_batches()[0]
+    with pytest.raises(ValueError) as exc_info:
+        _to_requested_schema(requested_schema, file_schema, batch, downcast_ns_timestamp_to_us=False, include_field_ids=False)
+
+    assert "Unsupported schema projection from timestamp[ns] to timestamp[us]" in str(exc_info.value)

@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+import os
 import warnings
 from abc import ABC, abstractmethod
 from io import SEEK_SET
@@ -36,6 +37,7 @@ from typing import (
     List,
     Optional,
     Protocol,
+    Tuple,
     Type,
     Union,
     runtime_checkable,
@@ -46,6 +48,10 @@ from pyiceberg.typedef import EMPTY_DICT, Properties
 
 logger = logging.getLogger(__name__)
 
+AWS_REGION = "client.region"
+AWS_ACCESS_KEY_ID = "client.access-key-id"
+AWS_SECRET_ACCESS_KEY = "client.secret-access-key"
+AWS_SESSION_TOKEN = "client.session-token"
 S3_ENDPOINT = "s3.endpoint"
 S3_ACCESS_KEY_ID = "s3.access-key-id"
 S3_SECRET_ACCESS_KEY = "s3.secret-access-key"
@@ -53,10 +59,20 @@ S3_SESSION_TOKEN = "s3.session-token"
 S3_REGION = "s3.region"
 S3_PROXY_URI = "s3.proxy-uri"
 S3_CONNECT_TIMEOUT = "s3.connect-timeout"
+S3_SIGNER_URI = "s3.signer.uri"
+S3_SIGNER_ENDPOINT = "s3.signer.endpoint"
+S3_SIGNER_ENDPOINT_DEFAULT = "v1/aws/s3/sign"
 HDFS_HOST = "hdfs.host"
 HDFS_PORT = "hdfs.port"
 HDFS_USER = "hdfs.user"
 HDFS_KERB_TICKET = "hdfs.kerberos_ticket"
+ADLFS_CONNECTION_STRING = "adlfs.connection-string"
+ADLFS_ACCOUNT_NAME = "adlfs.account-name"
+ADLFS_ACCOUNT_KEY = "adlfs.account-key"
+ADLFS_SAS_TOKEN = "adlfs.sas-token"
+ADLFS_TENANT_ID = "adlfs.tenant-id"
+ADLFS_CLIENT_ID = "adlfs.client-id"
+ADLFS_ClIENT_SECRET = "adlfs.client-secret"
 GCS_TOKEN = "gcs.oauth2.token"
 GCS_TOKEN_EXPIRES_AT_MS = "gcs.oauth2.token-expires-at"
 GCS_PROJECT_ID = "gcs.project-id"
@@ -68,6 +84,7 @@ GCS_SESSION_KWARGS = "gcs.session-kwargs"
 GCS_ENDPOINT = "gcs.endpoint"
 GCS_DEFAULT_LOCATION = "gcs.default-bucket-location"
 GCS_VERSION_AWARE = "gcs.version-aware"
+PYARROW_USE_LARGE_TYPES_ON_READ = "pyarrow.use-large-types-on-read"
 
 
 @runtime_checkable
@@ -277,6 +294,7 @@ SCHEMA_TO_FILE_IO: Dict[str, List[str]] = {
     "gs": [ARROW_FILE_IO],
     "file": [ARROW_FILE_IO, FSSPEC_FILE_IO],
     "hdfs": [ARROW_FILE_IO],
+    "viewfs": [ARROW_FILE_IO],
     "abfs": [FSSPEC_FILE_IO],
     "abfss": [FSSPEC_FILE_IO],
 }
@@ -338,5 +356,16 @@ def load_file_io(properties: Properties = EMPTY_DICT, location: Optional[str] = 
         return PyArrowFileIO(properties)
     except ModuleNotFoundError as e:
         raise ModuleNotFoundError(
-            'Could not load a FileIO, please consider installing one: pip3 install "pyiceberg[s3fs]", for more options refer to the docs.'
+            'Could not load a FileIO, please consider installing one: pip3 install "pyiceberg[pyarrow]", for more options refer to the docs.'
         ) from e
+
+
+def _parse_location(location: str) -> Tuple[str, str, str]:
+    """Return the path without the scheme."""
+    uri = urlparse(location)
+    if not uri.scheme:
+        return "file", uri.netloc, os.path.abspath(location)
+    elif uri.scheme in ("hdfs", "viewfs"):
+        return uri.scheme, uri.netloc, uri.path
+    else:
+        return uri.scheme, uri.netloc, f"{uri.netloc}{uri.path}"

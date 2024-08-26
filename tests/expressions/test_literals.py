@@ -275,7 +275,7 @@ def test_decimal_to_decimal_conversion() -> None:
 
 
 def test_timestamp_to_date() -> None:
-    epoch_lit = TimestampLiteral(int(datetime.datetime.fromisoformat("1970-01-01T01:23:45.678").timestamp() * 1_000_000))
+    epoch_lit = TimestampLiteral(int(datetime.datetime.fromisoformat("1970-01-01T00:00:00.000000+00:00").timestamp() * 1_000_000))
     date_lit = epoch_lit.to(DateType())
 
     assert date_lit.value == 0
@@ -385,17 +385,23 @@ def test_string_to_decimal_literal() -> None:
 
 
 def test_string_to_boolean_literal() -> None:
-    assert literal(True) == literal("true").to(BooleanType())
-    assert literal(True) == literal("True").to(BooleanType())
-    assert literal(False) == literal("false").to(BooleanType())
-    assert literal(False) == literal("False").to(BooleanType())
+    assert literal("true").to(BooleanType()) == literal(True)
+    assert literal("True").to(BooleanType()) == literal(True)
+    assert literal("false").to(BooleanType()) == literal(False)
+    assert literal("False").to(BooleanType()) == literal(False)
+    assert literal("TRUE").to(BooleanType()) == literal(True)
+    assert literal("FALSE").to(BooleanType()) == literal(False)
 
 
-def test_invalid_string_to_boolean_literal() -> None:
-    invalid_boolean_str = literal("unknown")
+@pytest.mark.parametrize(
+    "val",
+    ["unknown", "off", "on", "0", "1", "y", "yes", "n", "no", "t", "f"],
+)
+def test_invalid_string_to_boolean_literal(val: Any) -> None:
+    invalid_boolean_str = literal(val)
     with pytest.raises(ValueError) as e:
         _ = invalid_boolean_str.to(BooleanType())
-    assert "Could not convert unknown into a boolean" in str(e.value)
+    assert f"Could not convert {val} into a boolean" in str(e.value)
 
 
 # MISC
@@ -758,7 +764,6 @@ def test_invalid_uuid_conversions() -> None:
             DecimalType(9, 2),
             StringType(),
             FixedType(1),
-            BinaryType(),
         ],
     )
 
@@ -880,6 +885,25 @@ def test_uuid_literal_initialization() -> None:
     uuid_literal = literal(test_uuid)
     assert isinstance(uuid_literal, Literal)
     assert test_uuid.bytes == uuid_literal.value
+
+
+def test_uuid_to_fixed() -> None:
+    test_uuid = uuid.uuid4()
+    uuid_literal = literal(test_uuid)
+    fixed_literal = uuid_literal.to(FixedType(16))
+    assert test_uuid.bytes == fixed_literal.value
+    with pytest.raises(TypeError) as e:
+        uuid_literal.to(FixedType(15))
+    assert "Cannot convert UUIDLiteral into fixed[15], different length: 15 <> 16" in str(e.value)
+    assert isinstance(fixed_literal, FixedLiteral)  # type: ignore
+
+
+def test_uuid_to_binary() -> None:
+    test_uuid = uuid.uuid4()
+    uuid_literal = literal(test_uuid)
+    binary_literal = uuid_literal.to(BinaryType())
+    assert test_uuid.bytes == binary_literal.value
+    assert isinstance(binary_literal, BinaryLiteral)  # type: ignore
 
 
 #   __  __      ___

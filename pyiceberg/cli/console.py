@@ -59,11 +59,22 @@ def catch_exception() -> Callable:  # type: ignore
 @click.option("--catalog")
 @click.option("--verbose", type=click.BOOL)
 @click.option("--output", type=click.Choice(["text", "json"]), default="text")
+@click.option("--ugi")
 @click.option("--uri")
 @click.option("--credential")
 @click.pass_context
-def run(ctx: Context, catalog: Optional[str], verbose: bool, output: str, uri: Optional[str], credential: Optional[str]) -> None:
+def run(
+    ctx: Context,
+    catalog: Optional[str],
+    verbose: bool,
+    output: str,
+    ugi: Optional[str],
+    uri: Optional[str],
+    credential: Optional[str],
+) -> None:
     properties = {}
+    if ugi:
+        properties["ugi"] = ugi
     if uri:
         properties["uri"] = uri
     if credential:
@@ -101,9 +112,13 @@ def list(ctx: Context, parent: Optional[str]) -> None:  # pylint: disable=redefi
     """List tables or namespaces."""
     catalog, output = _catalog_and_output(ctx)
 
-    identifiers = catalog.list_namespaces(parent or ())
-    if not identifiers and parent:
+    identifiers = []
+    if parent:
+        # Do we have tables under parent namespace?
         identifiers = catalog.list_tables(parent)
+    if not identifiers:
+        # List hierarchical namespaces if parent, root namespaces otherwise.
+        identifiers = catalog.list_namespaces(parent or ())
     output.identifiers(identifiers)
 
 
