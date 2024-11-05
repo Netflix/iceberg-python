@@ -32,6 +32,7 @@ import logging
 import os
 import re
 import uuid
+import warnings
 from abc import ABC, abstractmethod
 from concurrent.futures import Future
 from copy import copy
@@ -56,7 +57,6 @@ from typing import (
 )
 from urllib.parse import urlparse
 
-import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.dataset as ds
@@ -811,7 +811,17 @@ def _combine_positional_deletes(positional_deletes: List[pa.ChunkedArray], start
         all_chunks = positional_deletes[0]
     else:
         all_chunks = pa.chunked_array(itertools.chain(*[arr.chunks for arr in positional_deletes]))
-    return np.subtract(np.setdiff1d(np.arange(start_index, end_index), all_chunks, assume_unique=False), start_index)
+
+    # Create the full range array with pyarrow
+    full_range = pa.array(range(start_index, end_index))
+    # When available, replace with Arrow generator to improve performance
+    # See https://github.com/apache/iceberg-python/issues/1271 for details
+
+    # Filter out values in all_chunks from full_range
+    result = pc.filter(full_range, pc.invert(pc.is_in(full_range, value_set=all_chunks)))
+
+    # Subtract the start_index from each element in the result
+    return pc.subtract(result, pa.scalar(start_index))
 
 
 def pyarrow_to_schema(
@@ -1237,10 +1247,13 @@ def _task_to_record_batches(
         for batch in batches:
             next_index = next_index + len(batch)
             current_index = next_index - len(batch)
+            output_batches = iter([batch])
             if positional_deletes:
                 # Create the mask of indices that we're interested in
                 indices = _combine_positional_deletes(positional_deletes, current_index, current_index + len(batch))
                 batch = batch.take(indices)
+                output_batches = iter([batch])
+
                 # Apply the user filter
                 if pyarrow_filter is not None:
                     # we need to switch back and forth between RecordBatch and Table
@@ -1250,10 +1263,15 @@ def _task_to_record_batches(
                     arrow_table = arrow_table.filter(pyarrow_filter)
                     if len(arrow_table) == 0:
                         continue
-                    batch = arrow_table.to_batches()[0]
-            yield _to_requested_schema(
-                projected_schema, file_project_schema, batch, downcast_ns_timestamp_to_us=True, use_large_types=use_large_types
-            )
+                    output_batches = arrow_table.to_batches()
+            for output_batch in output_batches:
+                yield _to_requested_schema(
+                    projected_schema,
+                    file_project_schema,
+                    output_batch,
+                    downcast_ns_timestamp_to_us=True,
+                    use_large_types=use_large_types,
+                )
 
 
 def _task_to_table(
@@ -1670,23 +1688,6 @@ def project_batches(
             total_row_count += len(batch)
 
 
-@deprecated(
-    deprecated_in="0.7.0",
-    removed_in="0.8.0",
-    help_message="The public API for 'to_requested_schema' is deprecated and is replaced by '_to_requested_schema'",
-)
-def to_requested_schema(requested_schema: Schema, file_schema: Schema, table: pa.Table) -> pa.Table:
-    struct_array = visit_with_partner(requested_schema, table, ArrowProjectionVisitor(file_schema), ArrowAccessor(file_schema))
-
-    arrays = []
-    fields = []
-    for pos, field in enumerate(requested_schema.fields):
-        array = struct_array.field(pos)
-        arrays.append(array)
-        fields.append(pa.field(field.name, array.type, field.optional))
-    return pa.Table.from_arrays(arrays, schema=pa.schema(fields))
-
-
 def _to_requested_schema(
     requested_schema: Schema,
     file_schema: Schema,
@@ -1798,7 +1799,11 @@ class ArrowProjectionVisitor(SchemaWithPartnerVisitor[pa.Array, Optional[pa.Arra
             else:
                 raise ResolveError(f"Field is required, and could not be found in the file: {field}")
 
-        return pa.StructArray.from_arrays(arrays=field_arrays, fields=pa.struct(fields))
+        return pa.StructArray.from_arrays(
+            arrays=field_arrays,
+            fields=pa.struct(fields),
+            mask=struct_array.is_null() if isinstance(struct_array, pa.StructArray) else None,
+        )
 
     def field(self, field: NestedField, _: Optional[pa.Array], field_array: Optional[pa.Array]) -> Optional[pa.Array]:
         return field_array
@@ -2544,7 +2549,7 @@ def _get_parquet_writer_kwargs(table_properties: Properties) -> Dict[str, Any]:
         f"{TableProperties.PARQUET_BLOOM_FILTER_COLUMN_ENABLED_PREFIX}.*",
     ]:
         if unsupported_keys := fnmatch.filter(table_properties, key_pattern):
-            raise NotImplementedError(f"Parquet writer option(s) {unsupported_keys} not implemented")
+            warnings.warn(f"Parquet writer option(s) {unsupported_keys} not implemented")
 
     compression_codec = table_properties.get(TableProperties.PARQUET_COMPRESSION, TableProperties.PARQUET_COMPRESSION_DEFAULT)
     compression_level = property_as_int(
