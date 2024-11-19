@@ -101,18 +101,20 @@ For the FileIO there are several configuration options available:
 
 <!-- markdown-link-check-disable -->
 
-| Key                  | Example                  | Description                                                                                                                                                                                                                                               |
-| -------------------- | ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Key                  | Example                    | Description                                                                                                                                                                                                                                               |
+|----------------------|----------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | s3.endpoint          | <https://10.0.19.25/>      | Configure an alternative endpoint of the S3 service for the FileIO to access. This could be used to use S3FileIO with any s3-compatible object storage service that has a different endpoint, or access a private S3 endpoint in a virtual private cloud. |
-| s3.access-key-id     | admin                    | Configure the static access key id used to access the FileIO.                                                                                                                                                                                             |
-| s3.secret-access-key | password                 | Configure the static secret access key used to access the FileIO.                                                                                                                                                                                         |
-| s3.session-token     | AQoDYXdzEJr...           | Configure the static session token used to access the FileIO.                                                                                                                                                                                             |
-| s3.signer            | bearer                   | Configure the signature version of the FileIO.                                                                                                                                                                                                            |
+| s3.access-key-id     | admin                      | Configure the static access key id used to access the FileIO.                                                                                                                                                                                             |
+| s3.secret-access-key | password                   | Configure the static secret access key used to access the FileIO.                                                                                                                                                                                         |
+| s3.session-token     | AQoDYXdzEJr...             | Configure the static session token used to access the FileIO.                                                                                                                                                                                             |
+| s3.role-session-name      | session                    | An optional identifier for the assumed role session.                                                                                                                                                                                                      |
+| s3.role-arn          | arn:aws:...                | AWS Role ARN. If provided instead of access_key and secret_key, temporary credentials will be fetched by assuming this role.                                                                                                                              |
+| s3.signer            | bearer                     | Configure the signature version of the FileIO.                                                                                                                                                                                                            |
 | s3.signer.uri        | <http://my.signer:8080/s3> | Configure the remote signing uri if it differs from the catalog uri. Remote signing is only implemented for `FsspecFileIO`. The final request is sent to `<s3.signer.uri>/<s3.signer.endpoint>`.                                                          |
-| s3.signer.endpoint   | v1/main/s3-sign          | Configure the remote signing endpoint. Remote signing is only implemented for `FsspecFileIO`. The final request is sent to `<s3.signer.uri>/<s3.signer.endpoint>`. (default : v1/aws/s3/sign).                                                            |
-| s3.region            | us-west-2                | Sets the region of the bucket                                                                                                                                                                                                                             |
+| s3.signer.endpoint   | v1/main/s3-sign            | Configure the remote signing endpoint. Remote signing is only implemented for `FsspecFileIO`. The final request is sent to `<s3.signer.uri>/<s3.signer.endpoint>`. (default : v1/aws/s3/sign).                                                            |
+| s3.region            | us-west-2                  | Sets the region of the bucket                                                                                                                                                                                                                             |
 | s3.proxy-uri         | <http://my.proxy.com:8080> | Configure the proxy server to be used by the FileIO.                                                                                                                                                                                                      |
-| s3.connect-timeout   | 60.0                     | Configure socket connection timeout, in seconds.                                                                                                                                                                                                          |
+| s3.connect-timeout   | 60.0                       | Configure socket connection timeout, in seconds.                                                                                                                                                                                                          |
 
 <!-- markdown-link-check-enable-->
 
@@ -159,7 +161,7 @@ For the FileIO there are several configuration options available:
 | gcs.cache-timeout           | 60                  | Configure the cache expiration time in seconds for object metadata cache                                                                                                                                                                            |
 | gcs.requester-pays          | False               | Configure whether to use requester-pays requests                                                                                                                                                                                                    |
 | gcs.session-kwargs          | {}                  | Configure a dict of parameters to pass on to aiohttp.ClientSession; can contain, for example, proxy settings.                                                                                                                                       |
-| gcs.endpoint                | <http://0.0.0.0:4443> | Configure an alternative endpoint for the GCS FileIO to access (format protocol://host:port) If not given, defaults to the value of environment variable "STORAGE_EMULATOR_HOST"; if that is not set either, will use the standard Google endpoint. |
+| gcs.service.host            | <http://0.0.0.0:4443> | Configure an alternative endpoint for the GCS FileIO to access (format protocol://host:port) If not given, defaults to the value of environment variable "STORAGE_EMULATOR_HOST"; if that is not set either, will use the standard Google endpoint. |
 | gcs.default-location        | US                  | Configure the default location where buckets are created, like 'US' or 'EUROPE-WEST3'.                                                                                                                                                              |
 | gcs.version-aware           | False               | Configure whether to support object versioning on the GCS bucket.                                                                                                                                                                                   |
 
@@ -345,7 +347,7 @@ catalog:
 <!-- prettier-ignore-start -->
 
 !!! warning "Removed Properties"
-    The properties `profile_name`, `region_name`, `botocore_session`, `aws_access_key_id`, `aws_secret_access_key`, and `aws_session_token` were deprecated and removed in 0.8.0
+    The properties `profile_name`, `region_name`, `aws_access_key_id`, `aws_secret_access_key`, and `aws_session_token` were deprecated and removed in 0.8.0
 
 <!-- prettier-ignore-end -->
 
@@ -401,7 +403,7 @@ catalog:
 <!-- prettier-ignore-start -->
 
 !!! warning "Removed Properties"
-    The properties `profile_name`, `region_name`, `botocore_session`, `aws_access_key_id`, `aws_secret_access_key`, and `aws_session_token` were deprecated and removed in 0.8.0
+    The properties `profile_name`, `region_name`, `aws_access_key_id`, `aws_secret_access_key`, and `aws_session_token` were deprecated and removed in 0.8.0
 
 <!-- prettier-ignore-end -->
 
@@ -438,6 +440,8 @@ configures the AWS credentials for both Glue Catalog and S3 FileIO.
 | client.access-key-id     | admin          | Configure the static access key id used to access both the Glue/DynamoDB Catalog and the S3 FileIO     |
 | client.secret-access-key | password       | Configure the static secret access key used to access both the Glue/DynamoDB Catalog and the S3 FileIO |
 | client.session-token     | AQoDYXdzEJr... | Configure the static session token used to access both the Glue/DynamoDB Catalog and the S3 FileIO     |
+| client.role-session-name      | session                    | An optional identifier for the assumed role session.                                                                                                                                                                                                      |
+| client.role-arn          | arn:aws:...                | AWS Role ARN. If provided instead of access_key and secret_key, temporary credentials will be fetched by assuming this role.                                                                                                                              |
 
 <!-- prettier-ignore-start -->
 

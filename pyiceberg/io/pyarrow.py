@@ -85,10 +85,13 @@ from pyiceberg.expressions.visitors import visit as boolean_expression_visit
 from pyiceberg.io import (
     AWS_ACCESS_KEY_ID,
     AWS_REGION,
+    AWS_ROLE_ARN,
+    AWS_ROLE_SESSION_NAME,
     AWS_SECRET_ACCESS_KEY,
     AWS_SESSION_TOKEN,
     GCS_DEFAULT_LOCATION,
     GCS_ENDPOINT,
+    GCS_SERVICE_HOST,
     GCS_TOKEN,
     GCS_TOKEN_EXPIRES_AT_MS,
     HDFS_HOST,
@@ -101,6 +104,8 @@ from pyiceberg.io import (
     S3_ENDPOINT,
     S3_PROXY_URI,
     S3_REGION,
+    S3_ROLE_ARN,
+    S3_ROLE_SESSION_NAME,
     S3_SECRET_ACCESS_KEY,
     S3_SESSION_TOKEN,
     FileIO,
@@ -159,7 +164,7 @@ from pyiceberg.types import (
 from pyiceberg.utils.concurrent import ExecutorFactory
 from pyiceberg.utils.config import Config
 from pyiceberg.utils.datetime import millis_to_datetime
-from pyiceberg.utils.deprecated import deprecated
+from pyiceberg.utils.deprecated import deprecated, deprecation_message
 from pyiceberg.utils.properties import get_first_property_value, property_as_bool, property_as_int
 from pyiceberg.utils.singleton import Singleton
 from pyiceberg.utils.truncate import truncate_upper_bound_binary_string, truncate_upper_bound_text_string
@@ -362,6 +367,12 @@ class PyArrowFileIO(FileIO):
             if connect_timeout := self.properties.get(S3_CONNECT_TIMEOUT):
                 client_kwargs["connect_timeout"] = float(connect_timeout)
 
+            if role_arn := get_first_property_value(self.properties, S3_ROLE_ARN, AWS_ROLE_ARN):
+                client_kwargs["role_arn"] = role_arn
+
+            if session_name := get_first_property_value(self.properties, S3_ROLE_SESSION_NAME, AWS_ROLE_SESSION_NAME):
+                client_kwargs["session_name"] = session_name
+
             return S3FileSystem(**client_kwargs)
         elif scheme in ("hdfs", "viewfs"):
             from pyarrow.fs import HadoopFileSystem
@@ -390,7 +401,13 @@ class PyArrowFileIO(FileIO):
                 gcs_kwargs["credential_token_expiration"] = millis_to_datetime(int(expiration))
             if bucket_location := self.properties.get(GCS_DEFAULT_LOCATION):
                 gcs_kwargs["default_bucket_location"] = bucket_location
-            if endpoint := self.properties.get(GCS_ENDPOINT):
+            if endpoint := get_first_property_value(self.properties, GCS_SERVICE_HOST, GCS_ENDPOINT):
+                if self.properties.get(GCS_ENDPOINT):
+                    deprecation_message(
+                        deprecated_in="0.8.0",
+                        removed_in="0.9.0",
+                        help_message=f"The property {GCS_ENDPOINT} is deprecated, please use {GCS_SERVICE_HOST} instead",
+                    )
                 url_parts = urlparse(endpoint)
                 gcs_kwargs["scheme"] = url_parts.scheme
                 gcs_kwargs["endpoint_override"] = url_parts.netloc

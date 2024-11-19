@@ -112,6 +112,7 @@ class IdentifierKind(Enum):
     VIEW = "view"
 
 
+ACCESS_DELEGATION_DEFAULT = "vended-credentials"
 AUTHORIZATION_HEADER = "Authorization"
 BEARER_PREFIX = "Bearer"
 CATALOG_SCOPE = "catalog"
@@ -155,7 +156,7 @@ _RETRY_ARGS = {
 
 
 class TableResponse(IcebergBaseModel):
-    metadata_location: Optional[str] = Field(alias="metadata-location")
+    metadata_location: Optional[str] = Field(alias="metadata-location", default=None)
     metadata: TableMetadata
     config: Properties = Field(default_factory=dict)
 
@@ -564,7 +565,7 @@ class RestCatalog(Catalog):
         session.headers["Content-type"] = "application/json"
         session.headers["X-Client-Version"] = ICEBERG_REST_SPEC_VERSION
         session.headers["User-Agent"] = f"PyIceberg/{__version__}"
-        session.headers["X-Iceberg-Access-Delegation"] = "vended-credentials"
+        session.headers.setdefault("X-Iceberg-Access-Delegation", ACCESS_DELEGATION_DEFAULT)
 
     def _extract_headers_from_properties(self) -> Dict[str, str]:
         return {key[len(HEADER_PREFIX) :]: value for key, value in self.properties.items() if key.startswith(HEADER_PREFIX)}
@@ -606,7 +607,6 @@ class RestCatalog(Catalog):
             response.raise_for_status()
         except HTTPError as exc:
             self._handle_non_200_response(exc, {409: TableAlreadyExistsError})
-
         return TableResponse(**response.json())
 
     @retry(**_RETRY_ARGS)
@@ -907,7 +907,7 @@ class RestCatalog(Catalog):
 
     @retry(**_RETRY_ARGS)
     def drop_view(self, identifier: Union[str]) -> None:
-        identifier_tuple = self.identifier_to_tuple_without_catalog(identifier)
+        identifier_tuple = self._identifier_to_tuple_without_catalog(identifier)
         response = self._session.delete(
             self.url(
                 Endpoints.drop_view, prefixed=True, **self._split_identifier_for_path(identifier_tuple, IdentifierKind.VIEW)
