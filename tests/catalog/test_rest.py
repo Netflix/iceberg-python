@@ -49,7 +49,7 @@ from pyiceberg.utils.config import Config
 
 TEST_URI = "https://iceberg-test-catalog/"
 TEST_CREDENTIALS = "client:secret"
-TEST_AUTH_URL = "https://auth-endpoint/"
+TEST_OAUTH2_SERVER_URI = "https://auth-endpoint/"
 TEST_TOKEN = "some_jwt_token"
 TEST_SCOPE = "openid_offline_corpds_ds_profile"
 TEST_AUDIENCE = "test_audience"
@@ -121,6 +121,9 @@ def test_no_uri_supplied() -> None:
         RestCatalog("production")
 
 
+@pytest.mark.filterwarnings(
+    "ignore:Deprecated in 0.8.0, will be removed in 1.0.0. Iceberg REST client is missing the OAuth2 server URI:DeprecationWarning"
+)
 def test_token_200(rest_mock: Mocker) -> None:
     rest_mock.post(
         f"{TEST_URI}v1/oauth/tokens",
@@ -141,6 +144,9 @@ def test_token_200(rest_mock: Mocker) -> None:
     )
 
 
+@pytest.mark.filterwarnings(
+    "ignore:Deprecated in 0.8.0, will be removed in 1.0.0. Iceberg REST client is missing the OAuth2 server URI:DeprecationWarning"
+)
 def test_token_200_without_optional_fields(rest_mock: Mocker) -> None:
     rest_mock.post(
         f"{TEST_URI}v1/oauth/tokens",
@@ -157,6 +163,9 @@ def test_token_200_without_optional_fields(rest_mock: Mocker) -> None:
     )
 
 
+@pytest.mark.filterwarnings(
+    "ignore:Deprecated in 0.8.0, will be removed in 1.0.0. Iceberg REST client is missing the OAuth2 server URI:DeprecationWarning"
+)
 def test_token_with_optional_oauth_params(rest_mock: Mocker) -> None:
     mock_request = rest_mock.post(
         f"{TEST_URI}v1/oauth/tokens",
@@ -179,6 +188,9 @@ def test_token_with_optional_oauth_params(rest_mock: Mocker) -> None:
     assert TEST_RESOURCE in mock_request.last_request.text
 
 
+@pytest.mark.filterwarnings(
+    "ignore:Deprecated in 0.8.0, will be removed in 1.0.0. Iceberg REST client is missing the OAuth2 server URI:DeprecationWarning"
+)
 def test_token_with_optional_oauth_params_as_empty(rest_mock: Mocker) -> None:
     mock_request = rest_mock.post(
         f"{TEST_URI}v1/oauth/tokens",
@@ -199,6 +211,9 @@ def test_token_with_optional_oauth_params_as_empty(rest_mock: Mocker) -> None:
     assert TEST_RESOURCE not in mock_request.last_request.text
 
 
+@pytest.mark.filterwarnings(
+    "ignore:Deprecated in 0.8.0, will be removed in 1.0.0. Iceberg REST client is missing the OAuth2 server URI:DeprecationWarning"
+)
 def test_token_with_default_scope(rest_mock: Mocker) -> None:
     mock_request = rest_mock.post(
         f"{TEST_URI}v1/oauth/tokens",
@@ -217,6 +232,9 @@ def test_token_with_default_scope(rest_mock: Mocker) -> None:
     assert "catalog" in mock_request.last_request.text
 
 
+@pytest.mark.filterwarnings(
+    "ignore:Deprecated in 0.8.0, will be removed in 1.0.0. Iceberg REST client is missing the OAuth2 server URI:DeprecationWarning"
+)
 def test_token_with_custom_scope(rest_mock: Mocker) -> None:
     mock_request = rest_mock.post(
         f"{TEST_URI}v1/oauth/tokens",
@@ -236,9 +254,12 @@ def test_token_with_custom_scope(rest_mock: Mocker) -> None:
     assert TEST_SCOPE in mock_request.last_request.text
 
 
-def test_token_200_w_auth_url(rest_mock: Mocker) -> None:
+@pytest.mark.filterwarnings(
+    "ignore:Deprecated in 0.8.0, will be removed in 1.0.0. Iceberg REST client is missing the OAuth2 server URI:DeprecationWarning"
+)
+def test_token_200_w_oauth2_server_uri(rest_mock: Mocker) -> None:
     rest_mock.post(
-        TEST_AUTH_URL,
+        TEST_OAUTH2_SERVER_URI,
         json={
             "access_token": TEST_TOKEN,
             "token_type": "Bearer",
@@ -250,7 +271,7 @@ def test_token_200_w_auth_url(rest_mock: Mocker) -> None:
     )
     # pylint: disable=W0212
     assert (
-        RestCatalog("rest", uri=TEST_URI, credential=TEST_CREDENTIALS, **{OAUTH2_SERVER_URI: TEST_AUTH_URL})._session.headers[
+        RestCatalog("rest", uri=TEST_URI, credential=TEST_CREDENTIALS, **{OAUTH2_SERVER_URI: OAUTH2_SERVER_URI})._session.headers[
             "Authorization"
         ]
         == f"Bearer {TEST_TOKEN}"
@@ -258,6 +279,9 @@ def test_token_200_w_auth_url(rest_mock: Mocker) -> None:
     # pylint: enable=W0212
 
 
+@pytest.mark.filterwarnings(
+    "ignore:Deprecated in 0.8.0, will be removed in 1.0.0. Iceberg REST client is missing the OAuth2 server URI:DeprecationWarning"
+)
 def test_config_200(requests_mock: Mocker) -> None:
     requests_mock.get(
         f"{TEST_URI}v1/config",
@@ -343,6 +367,9 @@ def test_config_sets_headers(requests_mock: Mocker) -> None:
     ), "Create namespace request did not include expected 'Customized-Header' header"
 
 
+@pytest.mark.filterwarnings(
+    "ignore:Deprecated in 0.8.0, will be removed in 1.0.0. Iceberg REST client is missing the OAuth2 server URI:DeprecationWarning"
+)
 def test_token_400(rest_mock: Mocker) -> None:
     rest_mock.post(
         f"{TEST_URI}v1/oauth/tokens",
@@ -356,6 +383,9 @@ def test_token_400(rest_mock: Mocker) -> None:
     assert str(e.value) == "invalid_client: Credentials for key invalid_key do not match"
 
 
+@pytest.mark.filterwarnings(
+    "ignore:Deprecated in 0.8.0, will be removed in 1.0.0. Iceberg REST client is missing the OAuth2 server URI:DeprecationWarning"
+)
 def test_token_401(rest_mock: Mocker) -> None:
     message = "invalid_client"
     rest_mock.post(
@@ -462,6 +492,42 @@ def test_list_views_404(rest_mock: Mocker) -> None:
     assert "Namespace does not exist" in str(e.value)
 
 
+def test_view_exists_204(rest_mock: Mocker) -> None:
+    namespace = "examples"
+    view = "some_view"
+    rest_mock.head(
+        f"{TEST_URI}v1/namespaces/{namespace}/views/{view}",
+        status_code=204,
+        request_headers=TEST_HEADERS,
+    )
+    catalog = RestCatalog("rest", uri=TEST_URI, token=TEST_TOKEN)
+    assert catalog.view_exists((namespace, view))
+
+
+def test_view_exists_404(rest_mock: Mocker) -> None:
+    namespace = "examples"
+    view = "some_view"
+    rest_mock.head(
+        f"{TEST_URI}v1/namespaces/{namespace}/views/{view}",
+        status_code=404,
+        request_headers=TEST_HEADERS,
+    )
+    catalog = RestCatalog("rest", uri=TEST_URI, token=TEST_TOKEN)
+    assert not catalog.view_exists((namespace, view))
+
+
+def test_view_exists_multilevel_namespace_404(rest_mock: Mocker) -> None:
+    multilevel_namespace = "core.examples.some_namespace"
+    view = "some_view"
+    rest_mock.head(
+        f"{TEST_URI}v1/namespaces/{multilevel_namespace}/views/{view}",
+        status_code=404,
+        request_headers=TEST_HEADERS,
+    )
+    catalog = RestCatalog("rest", uri=TEST_URI, token=TEST_TOKEN)
+    assert not catalog.view_exists((multilevel_namespace, view))
+
+
 def test_list_namespaces_200(rest_mock: Mocker) -> None:
     rest_mock.get(
         f"{TEST_URI}v1/namespaces",
@@ -489,6 +555,9 @@ def test_list_namespace_with_parent_200(rest_mock: Mocker) -> None:
     ]
 
 
+@pytest.mark.filterwarnings(
+    "ignore:Deprecated in 0.8.0, will be removed in 1.0.0. Iceberg REST client is missing the OAuth2 server URI:DeprecationWarning"
+)
 def test_list_namespaces_token_expired(rest_mock: Mocker) -> None:
     new_token = "new_jwt_token"
     new_header = dict(TEST_HEADERS)
@@ -681,6 +750,51 @@ def test_update_namespace_properties_200(rest_mock: Mocker) -> None:
     assert response == PropertiesUpdateSummary(removed=[], updated=["prop"], missing=["abc"])
 
 
+def test_namespace_exists_200(rest_mock: Mocker) -> None:
+    rest_mock.head(
+        f"{TEST_URI}v1/namespaces/fokko",
+        status_code=200,
+        request_headers=TEST_HEADERS,
+    )
+    catalog = RestCatalog("rest", uri=TEST_URI, token=TEST_TOKEN)
+
+    assert catalog.namespace_exists("fokko")
+
+
+def test_namespace_exists_204(rest_mock: Mocker) -> None:
+    rest_mock.head(
+        f"{TEST_URI}v1/namespaces/fokko",
+        status_code=204,
+        request_headers=TEST_HEADERS,
+    )
+    catalog = RestCatalog("rest", uri=TEST_URI, token=TEST_TOKEN)
+
+    assert catalog.namespace_exists("fokko")
+
+
+def test_namespace_exists_404(rest_mock: Mocker) -> None:
+    rest_mock.head(
+        f"{TEST_URI}v1/namespaces/fokko",
+        status_code=404,
+        request_headers=TEST_HEADERS,
+    )
+    catalog = RestCatalog("rest", uri=TEST_URI, token=TEST_TOKEN)
+
+    assert not catalog.namespace_exists("fokko")
+
+
+def test_namespace_exists_500(rest_mock: Mocker) -> None:
+    rest_mock.head(
+        f"{TEST_URI}v1/namespaces/fokko",
+        status_code=500,
+        request_headers=TEST_HEADERS,
+    )
+    catalog = RestCatalog("rest", uri=TEST_URI, token=TEST_TOKEN)
+
+    with pytest.raises(ServerError):
+        catalog.namespace_exists("fokko")
+
+
 def test_update_namespace_properties_404(rest_mock: Mocker) -> None:
     rest_mock.post(
         f"{TEST_URI}v1/namespaces/fokko/properties",
@@ -763,7 +877,7 @@ def test_load_table_from_self_identifier_200(
     )
     catalog = RestCatalog("rest", uri=TEST_URI, token=TEST_TOKEN)
     table = catalog.load_table(("pdames", "table"))
-    actual = catalog.load_table(table.identifier)
+    actual = catalog.load_table(table.name())
     expected = Table(
         identifier=("pdames", "table"),
         metadata_location=example_table_metadata_with_snapshot_v1_rest_json["metadata-location"],
@@ -801,7 +915,7 @@ def test_table_exists_200(rest_mock: Mocker) -> None:
         request_headers=TEST_HEADERS,
     )
     catalog = RestCatalog("rest", uri=TEST_URI, token=TEST_TOKEN)
-    assert not catalog.table_exists(("fokko", "table"))
+    assert catalog.table_exists(("fokko", "table"))
 
 
 def test_table_exists_204(rest_mock: Mocker) -> None:
@@ -1111,7 +1225,7 @@ def test_register_table_200(
     )
     assert actual.metadata.model_dump() == expected.metadata.model_dump()
     assert actual.metadata_location == expected.metadata_location
-    assert actual.identifier == expected.identifier
+    assert actual.name() == expected.name()
 
 
 def test_register_table_409(rest_mock: Mocker, table_schema_simple: Schema) -> None:
@@ -1174,7 +1288,7 @@ def test_delete_table_from_self_identifier_204(
         status_code=204,
         request_headers=TEST_HEADERS,
     )
-    catalog.drop_table(table.identifier)
+    catalog.drop_table(table.name())
 
 
 def test_rename_table_200(rest_mock: Mocker, example_table_metadata_with_snapshot_v1_rest_json: Dict[str, Any]) -> None:
@@ -1236,7 +1350,7 @@ def test_rename_table_from_self_identifier_200(
         status_code=200,
         request_headers=TEST_HEADERS,
     )
-    actual = catalog.rename_table(table.identifier, to_identifier)
+    actual = catalog.rename_table(table.name(), to_identifier)
     expected = Table(
         identifier=("pdames", "destination"),
         metadata_location=example_table_metadata_with_snapshot_v1_rest_json["metadata-location"],
