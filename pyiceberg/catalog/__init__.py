@@ -70,6 +70,7 @@ from pyiceberg.typedef import (
     Identifier,
     Properties,
     RecursiveDict,
+    TableVersion,
 )
 from pyiceberg.utils.config import Config, merge_config
 from pyiceberg.utils.properties import property_as_bool
@@ -195,7 +196,7 @@ def infer_catalog_type(name: str, catalog_properties: RecursiveDict) -> Optional
     Raises:
         ValueError: Raises a ValueError in case properties are missing, or the wrong type.
     """
-    if uri := catalog_properties.get("uri"):
+    if uri := catalog_properties.get(URI):
         if isinstance(uri, str):
             if uri.startswith("http"):
                 return CatalogType.REST
@@ -252,7 +253,7 @@ def load_catalog(name: Optional[str] = None, **properties: Optional[str]) -> Cat
 
     catalog_type = None
     if provided_catalog_type and isinstance(provided_catalog_type, str):
-        catalog_type = CatalogType[provided_catalog_type.upper()]
+        catalog_type = CatalogType(provided_catalog_type.lower())
     elif not provided_catalog_type:
         catalog_type = infer_catalog_type(name, conf)
 
@@ -260,6 +261,10 @@ def load_catalog(name: Optional[str] = None, **properties: Optional[str]) -> Cat
         return AVAILABLE_CATALOGS[catalog_type](name, cast(Dict[str, str], conf))
 
     raise ValueError(f"Could not initialize catalog with the following properties: {properties}")
+
+
+def list_catalogs() -> List[str]:
+    return _ENV_CONFIG.get_known_catalogs()
 
 
 def delete_files(io: FileIO, files_to_delete: Set[str], file_type: str) -> None:
@@ -739,7 +744,9 @@ class Catalog(ABC):
         return load_file_io({**self.properties, **properties}, location)
 
     @staticmethod
-    def _convert_schema_if_needed(schema: Union[Schema, "pa.Schema"]) -> Schema:
+    def _convert_schema_if_needed(
+        schema: Union[Schema, "pa.Schema"], format_version: TableVersion = TableProperties.DEFAULT_FORMAT_VERSION
+    ) -> Schema:
         if isinstance(schema, Schema):
             return schema
         try:
@@ -750,7 +757,10 @@ class Catalog(ABC):
             downcast_ns_timestamp_to_us = Config().get_bool(DOWNCAST_NS_TIMESTAMP_TO_US_ON_WRITE) or False
             if isinstance(schema, pa.Schema):
                 schema: Schema = visit_pyarrow(  # type: ignore
-                    schema, _ConvertToIcebergWithoutIDs(downcast_ns_timestamp_to_us=downcast_ns_timestamp_to_us)
+                    schema,
+                    _ConvertToIcebergWithoutIDs(
+                        downcast_ns_timestamp_to_us=downcast_ns_timestamp_to_us, format_version=format_version
+                    ),
                 )
                 return schema
         except ModuleNotFoundError:
@@ -843,7 +853,10 @@ class MetastoreCatalog(Catalog, ABC):
         Returns:
             StagedTable: the created staged table instance.
         """
-        schema: Schema = self._convert_schema_if_needed(schema)  # type: ignore
+        schema: Schema = self._convert_schema_if_needed(  # type: ignore
+            schema,
+            int(properties.get(TableProperties.FORMAT_VERSION, TableProperties.DEFAULT_FORMAT_VERSION)),  # type: ignore
+        )
 
         database_name, table_name = self.identifier_to_database_and_table(identifier)
 
@@ -923,6 +936,20 @@ class MetastoreCatalog(Catalog, ABC):
         return location.rstrip("/")
 
     def _get_default_warehouse_location(self, database_name: str, table_name: str) -> str:
+        """Return the default warehouse location using the convention of `warehousePath/databaseName/tableName`."""
+        database_properties = self.load_namespace_properties(database_name)
+        if database_location := database_properties.get(LOCATION):
+            database_location = database_location.rstrip("/")
+            return f"{database_location}/{table_name}"
+
+        if warehouse_path := self.properties.get(WAREHOUSE_LOCATION):
+            warehouse_path = warehouse_path.rstrip("/")
+            return f"{warehouse_path}/{database_name}/{table_name}"
+
+        raise ValueError("No default path is set, please specify a location when creating a table")
+
+    def _get_hive_style_warehouse_location(self, database_name: str, table_name: str) -> str:
+        """Return the default warehouse location following the Hive convention of `warehousePath/databaseName.db/tableName`."""
         database_properties = self.load_namespace_properties(database_name)
         if database_location := database_properties.get(LOCATION):
             database_location = database_location.rstrip("/")

@@ -36,13 +36,16 @@ from fsspec import AbstractFileSystem
 from fsspec.implementations.local import LocalFileSystem
 from requests import HTTPError
 
-from pyiceberg.catalog import TOKEN
+from pyiceberg.catalog import TOKEN, URI
 from pyiceberg.exceptions import SignError
 from pyiceberg.io import (
+    ADLS_ACCOUNT_HOST,
     ADLS_ACCOUNT_KEY,
     ADLS_ACCOUNT_NAME,
     ADLS_CLIENT_ID,
+    ADLS_CLIENT_SECRET,
     ADLS_CONNECTION_STRING,
+    ADLS_CREDENTIAL,
     ADLS_SAS_TOKEN,
     ADLS_TENANT_ID,
     AWS_ACCESS_KEY_ID,
@@ -59,6 +62,8 @@ from pyiceberg.io import (
     GCS_SESSION_KWARGS,
     GCS_TOKEN,
     GCS_VERSION_AWARE,
+    HF_ENDPOINT,
+    HF_TOKEN,
     S3_ACCESS_KEY_ID,
     S3_CONNECT_TIMEOUT,
     S3_ENDPOINT,
@@ -67,10 +72,10 @@ from pyiceberg.io import (
     S3_REQUEST_TIMEOUT,
     S3_SECRET_ACCESS_KEY,
     S3_SESSION_TOKEN,
+    S3_SIGNER,
     S3_SIGNER_ENDPOINT,
     S3_SIGNER_ENDPOINT_DEFAULT,
     S3_SIGNER_URI,
-    ADLS_ClIENT_SECRET,
     FileIO,
     InputFile,
     InputStream,
@@ -87,7 +92,7 @@ if TYPE_CHECKING:
 
 
 def s3v4_rest_signer(properties: Properties, request: "AWSRequest", **_: Any) -> "AWSRequest":
-    signer_url = properties.get(S3_SIGNER_URI, properties["uri"]).rstrip("/")
+    signer_url = properties.get(S3_SIGNER_URI, properties[URI]).rstrip("/")  # type: ignore
     signer_endpoint = properties.get(S3_SIGNER_ENDPOINT, S3_SIGNER_ENDPOINT_DEFAULT)
 
     signer_headers = {}
@@ -137,7 +142,7 @@ def _s3(properties: Properties) -> AbstractFileSystem:
     config_kwargs = {}
     register_events: Dict[str, Callable[[Properties], None]] = {}
 
-    if signer := properties.get("s3.signer"):
+    if signer := properties.get(S3_SIGNER):
         logger.info("Loading signer %s", signer)
         if signer_func := SIGNERS.get(signer):
             signer_func_with_properties = partial(signer_func, properties)
@@ -162,6 +167,7 @@ def _s3(properties: Properties) -> AbstractFileSystem:
     fs = S3FileSystem(client_kwargs=client_kwargs, config_kwargs=config_kwargs)
 
     for event_name, event_function in register_events.items():
+        fs.s3.meta.events.unregister(event_name, unique_id=1925)
         fs.s3.meta.events.register_last(event_name, event_function, unique_id=1925)
 
     return fs
@@ -189,9 +195,7 @@ def _adls(properties: Properties) -> AbstractFileSystem:
     from adlfs import AzureBlobFileSystem
 
     for key, sas_token in {
-        key.replace(f"{ADLS_SAS_TOKEN}.", ""): value
-        for key, value in properties.items()
-        if key.startswith(ADLS_SAS_TOKEN) and key.endswith(".windows.net")
+        key.replace(f"{ADLS_SAS_TOKEN}.", ""): value for key, value in properties.items() if key.startswith(ADLS_SAS_TOKEN)
     }.items():
         if ADLS_ACCOUNT_NAME not in properties:
             properties[ADLS_ACCOUNT_NAME] = key.split(".")[0]
@@ -200,12 +204,23 @@ def _adls(properties: Properties) -> AbstractFileSystem:
 
     return AzureBlobFileSystem(
         connection_string=properties.get(ADLS_CONNECTION_STRING),
+        credential=properties.get(ADLS_CREDENTIAL),
         account_name=properties.get(ADLS_ACCOUNT_NAME),
         account_key=properties.get(ADLS_ACCOUNT_KEY),
         sas_token=properties.get(ADLS_SAS_TOKEN),
         tenant_id=properties.get(ADLS_TENANT_ID),
         client_id=properties.get(ADLS_CLIENT_ID),
-        client_secret=properties.get(ADLS_ClIENT_SECRET),
+        client_secret=properties.get(ADLS_CLIENT_SECRET),
+        account_host=properties.get(ADLS_ACCOUNT_HOST),
+    )
+
+
+def _hf(properties: Properties) -> AbstractFileSystem:
+    from huggingface_hub import HfFileSystem
+
+    return HfFileSystem(
+        endpoint=properties.get(HF_ENDPOINT),
+        token=properties.get(HF_TOKEN),
     )
 
 
@@ -219,6 +234,7 @@ SCHEME_TO_FS = {
     "abfss": _adls,
     "gs": _gs,
     "gcs": _gs,
+    "hf": _hf,
 }
 
 
