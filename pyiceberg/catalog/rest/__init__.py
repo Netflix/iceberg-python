@@ -276,11 +276,11 @@ class RestCatalog(Catalog):
 
         # Mount custom adapters
         if session_adapters := self.properties.get("session_adapters"):
-            for prefix, adapter in session_adapters.items():  # type: ignore
+            for prefix, adapter in session_adapters.items():
                 session.mount(prefix, adapter)
         # Add custom auth
         if session_auth := self.properties.get("session_auth"):
-            session.auth = session_auth  # type: ignore
+            session.auth = session_auth
 
         return session
 
