@@ -42,7 +42,6 @@ from pyiceberg.expressions import (
 from pyiceberg.expressions.visitors import _InclusiveMetricsEvaluator, _StrictMetricsEvaluator
 from pyiceberg.manifest import DataFile, FileFormat
 from pyiceberg.schema import Schema
-from pyiceberg.typedef import Record
 from pyiceberg.types import (
     DoubleType,
     FloatType,
@@ -92,7 +91,7 @@ def schema_data_file() -> Schema:
 
 @pytest.fixture
 def data_file() -> DataFile:
-    return DataFile.from_args(
+    return DataFile(
         file_path="file_1.parquet",
         file_format=FileFormat.PARQUET,
         partition={},
@@ -134,7 +133,7 @@ def data_file() -> DataFile:
 
 @pytest.fixture
 def data_file_2() -> DataFile:
-    return DataFile.from_args(
+    return DataFile(
         file_path="file_2.parquet",
         file_format=FileFormat.PARQUET,
         partition={},
@@ -150,7 +149,7 @@ def data_file_2() -> DataFile:
 
 @pytest.fixture
 def data_file_3() -> DataFile:
-    return DataFile.from_args(
+    return DataFile(
         file_path="file_3.parquet",
         file_format=FileFormat.PARQUET,
         partition={},
@@ -166,7 +165,7 @@ def data_file_3() -> DataFile:
 
 @pytest.fixture
 def data_file_4() -> DataFile:
-    return DataFile.from_args(
+    return DataFile(
         file_path="file_4.parquet",
         file_format=FileFormat.PARQUET,
         partition={},
@@ -289,10 +288,10 @@ def test_missing_stats() -> None:
         NestedField(2, "no_stats", DoubleType(), required=False),
     )
 
-    no_stats_file = DataFile.from_args(
+    no_stats_file = DataFile(
         file_path="file_1.parquet",
         file_format=FileFormat.PARQUET,
-        partition=Record(),
+        partition={},
         record_count=50,
         value_counts=None,
         null_value_counts=None,
@@ -320,9 +319,7 @@ def test_missing_stats() -> None:
 
 
 def test_zero_record_file_stats(schema_data_file: Schema) -> None:
-    zero_record_data_file = DataFile.from_args(
-        file_path="file_1.parquet", file_format=FileFormat.PARQUET, partition=Record(), record_count=0
-    )
+    zero_record_data_file = DataFile(file_path="file_1.parquet", file_format=FileFormat.PARQUET, partition={}, record_count=0)
 
     expressions = [
         LessThan("no_stats", 5),
@@ -639,7 +636,7 @@ def schema_data_file_nan() -> Schema:
 
 @pytest.fixture
 def data_file_nan() -> DataFile:
-    return DataFile.from_args(
+    return DataFile(
         file_path="file.avro",
         file_format=FileFormat.PARQUET,
         partition={},
@@ -952,7 +949,7 @@ def strict_data_file_schema() -> Schema:
 
 @pytest.fixture
 def strict_data_file_1() -> DataFile:
-    return DataFile.from_args(
+    return DataFile(
         file_path="file_1.parquet",
         file_format=FileFormat.PARQUET,
         partition={},
@@ -993,7 +990,7 @@ def strict_data_file_1() -> DataFile:
 
 @pytest.fixture
 def strict_data_file_2() -> DataFile:
-    return DataFile.from_args(
+    return DataFile(
         file_path="file_2.parquet",
         file_format=FileFormat.PARQUET,
         partition={},
@@ -1018,7 +1015,7 @@ def strict_data_file_2() -> DataFile:
 
 @pytest.fixture
 def strict_data_file_3() -> DataFile:
-    return DataFile.from_args(
+    return DataFile(
         file_path="file_3.parquet",
         file_format=FileFormat.PARQUET,
         partition={},
@@ -1150,10 +1147,10 @@ def test_strict_missing_stats(strict_data_file_schema: Schema, strict_data_file_
         NestedField(2, "no_stats", DoubleType(), required=False),
     )
 
-    no_stats_file = DataFile.from_args(
+    no_stats_file = DataFile(
         file_path="file_1.parquet",
         file_format=FileFormat.PARQUET,
-        partition=Record(),
+        partition={},
         record_count=50,
         value_counts=None,
         null_value_counts=None,
@@ -1181,9 +1178,7 @@ def test_strict_missing_stats(strict_data_file_schema: Schema, strict_data_file_
 
 
 def test_strict_zero_record_file_stats(strict_data_file_schema: Schema) -> None:
-    zero_record_data_file = DataFile.from_args(
-        file_path="file_1.parquet", file_format=FileFormat.PARQUET, partition=Record(), record_count=0
-    )
+    zero_record_data_file = DataFile(file_path="file_1.parquet", file_format=FileFormat.PARQUET, partition={}, record_count=0)
 
     expressions = [
         LessThan("no_stats", 5),

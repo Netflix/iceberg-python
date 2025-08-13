@@ -51,9 +51,9 @@ try:
         @staticmethod
         def decompress(data: bytes) -> bytes:
             # Compressed data includes a 4-byte CRC32 checksum
-            checksum = data[-4:]  # store checksum before truncating data
-            data = data[0:-4]  # remove checksum from the data
+            data = data[0:-4]
             uncompressed = snappy.decompress(data)
+            checksum = data[-4:]
             SnappyCodec._check_crc32(uncompressed, checksum)
             return uncompressed
 

@@ -32,7 +32,6 @@ from typing import (
     List,
     Optional,
     Tuple,
-    Union,
 )
 from uuid import UUID
 
@@ -97,19 +96,7 @@ class TimestampWriter(Writer):
 
 
 @dataclass(frozen=True)
-class TimestampNanoWriter(Writer):
-    def write(self, encoder: BinaryEncoder, val: int) -> None:
-        encoder.write_int(val)
-
-
-@dataclass(frozen=True)
 class TimestamptzWriter(Writer):
-    def write(self, encoder: BinaryEncoder, val: int) -> None:
-        encoder.write_int(val)
-
-
-@dataclass(frozen=True)
-class TimestamptzNanoWriter(Writer):
     def write(self, encoder: BinaryEncoder, val: int) -> None:
         encoder.write_int(val)
 
@@ -122,17 +109,8 @@ class StringWriter(Writer):
 
 @dataclass(frozen=True)
 class UUIDWriter(Writer):
-    def write(self, encoder: BinaryEncoder, val: Union[UUID, bytes]) -> None:
-        if isinstance(val, UUID):
-            encoder.write(val.bytes)
-        else:
-            encoder.write(val)
-
-
-@dataclass(frozen=True)
-class UnknownWriter(Writer):
-    def write(self, encoder: BinaryEncoder, val: Any) -> None:
-        encoder.write_unknown(val)
+    def write(self, encoder: BinaryEncoder, val: UUID) -> None:
+        encoder.write(val.bytes)
 
 
 @dataclass(frozen=True)

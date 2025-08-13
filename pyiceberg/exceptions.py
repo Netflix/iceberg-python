@@ -122,7 +122,3 @@ class CommitStateUnknownException(RESTError):
 
 class WaitingForLockException(Exception):
     """Need to wait for a lock, try again."""
-
-
-class ValidationException(Exception):
-    """Raised when validation fails."""

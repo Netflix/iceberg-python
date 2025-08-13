@@ -17,7 +17,7 @@
 # under the License.
 #
 
-name: "Python CI"
+name: "Python Integration"
 
 on:
   push:
@@ -25,10 +25,10 @@ on:
     - 'main'
   pull_request:
     paths:
-    - '**'                              # Include all files and directories in the repository by default.
-    - '!.github/workflows/**'           # Exclude all workflow files
-    - '.github/workflows/python-ci.yml' # except the current file.
-    - '!.github/ISSUE_TEMPLATE/**'      # Exclude files and directories that don't impact tests or code like templates, metadata, and documentation.
+    - '**'                                       # Include all files and directories in the repository by default.
+    - '!.github/workflows/**'                    # Exclude all workflow files
+    - '.github/workflows/python-integration.yml' # except the current file.
+    - '!.github/ISSUE_TEMPLATE/**'               # Exclude files and directories that don't impact tests or code like templates, metadata, and documentation.
     - '!.gitignore'
     - '!.asf.yml'
     - '!mkdocs/**'
@@ -43,24 +43,17 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  lint-and-test:
+  integration-test:
     runs-on: ubuntu-22.04
-    strategy:
-      matrix:
-        python: ['3.9', '3.10', '3.11', '3.12']
 
     steps:
     - uses: actions/checkout@v4
-    - name: Install poetry
-      run: make install-poetry
-    - uses: actions/setup-python@v5
       with:
-        python-version: ${{ matrix.python }}
-        cache: poetry
-        cache-dependency-path: ./poetry.lock
+        fetch-depth: 2
     - name: Install
-      run: make install-dependencies
-    - name: Linters
-      run: make lint
-    - name: Tests
-      run: make test-coverage
+      run: make install
+    - name: Run integration tests
+      run: make test-integration
+    - name: Show debug logs
+      if: ${{ failure() }}
+      run: docker compose -f dev/docker-compose.yml logs

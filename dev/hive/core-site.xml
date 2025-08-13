@@ -50,9 +50,4 @@
       <name>fs.s3a.path.style.access</name>
       <value>true</value>
     </property>
-    <property>
-      <name>hive.metastore.disallow.incompatible.col.type.changes</name>
-      <value>false</value>
-    </property>
-
 </configuration>

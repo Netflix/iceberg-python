@@ -289,15 +289,15 @@ def test_column_assignment() -> None:
             c: int = Field()
             d: Optional[int] = Field()
 
-        ints_schema = Schema(
+        MANIFEST_ENTRY_SCHEMA = Schema(
             NestedField(3, "c", IntegerType(), required=True),
             NestedField(4, "d", IntegerType(), required=False),
         )
 
-        with AvroFile[Ints](PyArrowFileIO().new_input(tmp_avro_file), ints_schema, {-1: Ints}) as reader:
+        with AvroFile[Ints](PyArrowFileIO().new_input(tmp_avro_file), MANIFEST_ENTRY_SCHEMA, {-1: Ints}) as reader:
             records = list(reader)
 
-    assert repr(records) == "[Ints[3, None]]"
+    assert repr(records) == "[Ints[c=3, d=None]]"
 
 
 def test_resolver_initial_value() -> None:

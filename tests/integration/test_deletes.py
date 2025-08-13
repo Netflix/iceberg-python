@@ -467,19 +467,21 @@ def test_partitioned_table_positional_deletes_sequence_number(spark: SparkSessio
     assert snapshots[2].summary == Summary(
         Operation.OVERWRITE,
         **{
+            "added-files-size": snapshots[2].summary["total-files-size"],
             "added-data-files": "1",
-            "added-files-size": snapshots[2].summary["added-files-size"],
             "added-records": "2",
             "changed-partition-count": "1",
-            "deleted-data-files": "1",
-            "deleted-records": "3",
-            "removed-files-size": snapshots[2].summary["removed-files-size"],
-            "total-data-files": "2",
-            "total-delete-files": "1",
-            "total-equality-deletes": "0",
             "total-files-size": snapshots[2].summary["total-files-size"],
-            "total-position-deletes": "1",
-            "total-records": "4",
+            "total-delete-files": "0",
+            "total-data-files": "1",
+            "total-position-deletes": "0",
+            "total-records": "2",
+            "total-equality-deletes": "0",
+            "deleted-data-files": "2",
+            "removed-delete-files": "1",
+            "deleted-records": "5",
+            "removed-files-size": snapshots[2].summary["removed-files-size"],
+            "removed-position-deletes": "1",
         },
     )
 
@@ -894,32 +896,3 @@ def test_overwrite_with_filter_case_insensitive(test_table: Table) -> None:
     test_table.overwrite(df=new_table, overwrite_filter=f"Idx == {record_to_overwrite['idx']}", case_sensitive=False)
     assert record_to_overwrite not in test_table.scan().to_arrow().to_pylist()
     assert new_record_to_insert in test_table.scan().to_arrow().to_pylist()
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("format_version", [1, 2])
-@pytest.mark.filterwarnings("ignore:Delete operation did not match any records")
-def test_delete_on_empty_table(spark: SparkSession, session_catalog: RestCatalog, format_version: int) -> None:
-    identifier = f"default.test_delete_on_empty_table_{format_version}"
-
-    run_spark_commands(
-        spark,
-        [
-            f"DROP TABLE IF EXISTS {identifier}",
-            f"""
-            CREATE TABLE {identifier} (
-                volume              int
-            )
-            USING iceberg
-            TBLPROPERTIES('format-version' = {format_version})
-        """,
-        ],
-    )
-
-    tbl = session_catalog.load_table(identifier)
-
-    # Perform a delete operation on the empty table
-    tbl.delete(AlwaysTrue())
-
-    # Assert that no new snapshot was created because no rows were deleted
-    assert len(tbl.snapshots()) == 0

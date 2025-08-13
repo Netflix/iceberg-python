@@ -154,16 +154,9 @@ class Config:
                 raise ValueError(f"Catalog configurations needs to be an object: {catalog_name}")
             if catalog_name_lower in catalogs:
                 catalog_conf = catalogs[catalog_name_lower]
-                if not isinstance(catalog_conf, dict):
-                    raise ValueError(f"Configuration path catalogs.{catalog_name_lower} needs to be an object")
+                assert isinstance(catalog_conf, dict), f"Configuration path catalogs.{catalog_name_lower} needs to be an object"
                 return catalog_conf
         return None
-
-    def get_known_catalogs(self) -> List[str]:
-        catalogs = self.config.get(CATALOG, {})
-        if not isinstance(catalogs, dict):
-            raise ValueError("Catalog configurations needs to be an object")
-        return list(catalogs.keys())
 
     def get_int(self, key: str) -> Optional[int]:
         if (val := self.config.get(key)) is not None:

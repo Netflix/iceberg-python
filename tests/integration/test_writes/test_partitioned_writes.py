@@ -294,14 +294,13 @@ def test_object_storage_location_provider_excludes_partition_path(
         PartitionField(source_id=nested_field.field_id, field_id=1001, transform=IdentityTransform(), name=part_col)
     )
 
-    # Enable `write.object-storage.enabled` which is False by default
-    # `write.object-storage.partitioned-paths` is True by default
-    assert TableProperties.OBJECT_STORE_ENABLED_DEFAULT is False
-    assert TableProperties.WRITE_OBJECT_STORE_PARTITIONED_PATHS_DEFAULT is True
+    # write.object-storage.enabled and write.object-storage.partitioned-paths don't need to be specified as they're on by default
+    assert TableProperties.OBJECT_STORE_ENABLED_DEFAULT
+    assert TableProperties.WRITE_OBJECT_STORE_PARTITIONED_PATHS_DEFAULT
     tbl = _create_table(
         session_catalog=session_catalog,
         identifier=f"default.arrow_table_v{format_version}_with_null_partitioned_on_col_{part_col}",
-        properties={"format-version": str(format_version), TableProperties.OBJECT_STORE_ENABLED: True},
+        properties={"format-version": str(format_version)},
         data=[arrow_table_with_null],
         partition_spec=partition_spec,
     )
@@ -546,31 +545,27 @@ def test_summaries_with_null(spark: SparkSession, session_catalog: Catalog, arro
         "total-data-files": "6",
         "total-records": "6",
     }
-    assert "removed-files-size" in summaries[5]
-    assert "total-files-size" in summaries[5]
     assert summaries[5] == {
-        "removed-files-size": summaries[5]["removed-files-size"],
+        "removed-files-size": "15774",
         "changed-partition-count": "2",
         "total-equality-deletes": "0",
         "deleted-data-files": "4",
         "total-position-deletes": "0",
         "total-delete-files": "0",
         "deleted-records": "4",
-        "total-files-size": summaries[5]["total-files-size"],
+        "total-files-size": "8684",
         "total-data-files": "2",
         "total-records": "2",
     }
-    assert "added-files-size" in summaries[6]
-    assert "total-files-size" in summaries[6]
     assert summaries[6] == {
         "changed-partition-count": "2",
         "added-data-files": "2",
         "total-equality-deletes": "0",
         "added-records": "2",
         "total-position-deletes": "0",
-        "added-files-size": summaries[6]["added-files-size"],
+        "added-files-size": "7887",
         "total-delete-files": "0",
-        "total-files-size": summaries[6]["total-files-size"],
+        "total-files-size": "16571",
         "total-data-files": "4",
         "total-records": "4",
     }
@@ -711,10 +706,8 @@ def test_dynamic_partition_overwrite_evolve_partition(spark: SparkSession, sessi
     )
 
     identifier = f"default.partitioned_{format_version}_test_dynamic_partition_overwrite_evolve_partition"
-    try:
+    with pytest.raises(NoSuchTableError):
         session_catalog.drop_table(identifier)
-    except NoSuchTableError:
-        pass
 
     tbl = session_catalog.create_table(
         identifier=identifier,
